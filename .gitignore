@@ -1,0 +1,9 @@
+# OS / editor junk
+Thumbs.db
+.DS_Store
+*.log
+# local preview screenshots emitted next to articles (not part of the skill)
+_jptx_preview.png
+_xap_preview.png
+# dependencies (skill is zero-dep, but just in case)
+node_modules/

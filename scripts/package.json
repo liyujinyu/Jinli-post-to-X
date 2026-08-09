@@ -1,0 +1,10 @@
+{
+  "name": "x-article-publisher",
+  "version": "1.0.0",
+  "description": "Self-contained CDP + OS-level publisher for X Articles with body images.",
+  "private": true,
+  "scripts": {
+    "publish": "bun publish.ts"
+  },
+  "type": "module"
+}
