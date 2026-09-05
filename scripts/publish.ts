@@ -27,6 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { connect, CdpClient, sleep } from './cdp.ts';
 import { copyImage, paste, deleteSelection, pasteImage, sendKeys } from './os-clipboard.ts';
 import { parseArticle, type Block } from './markdown.ts';
+import { auditDraft, printReport } from './audit.ts';
 
 /** Resolve a path relative to this script file (works on Bun and Node). */
 function relPath(p: string): string {
@@ -1145,6 +1146,23 @@ async function main() {
       console.log('\n[--no-images] tokens left in body; run pw-images.ts to insert them.');
     }
     if (article.coverImage) await uploadCover(client, article.coverImage, selectors);
+
+    // ── 终审校验:草稿 DOM vs 源 markdown 逐项比对(块序/计数/token 残留/链接/标题)。
+    //    任何不一致都在这里点名,不留给作者肉眼预览去发现。
+    console.log('\n=== audit(终审校验)===');
+    let auditPass = true;
+    try {
+      const report = await auditDraft(client, article, selectors.composer);
+      printReport(report);
+      auditPass = report.pass;
+    } catch (e) {
+      auditPass = false;
+      console.warn('[audit] 校验执行失败(不阻断草稿):', (e as Error).message);
+    }
+    if (!auditPass) {
+      console.log('[audit] ⚠ 存在不一致项——可在浏览器里修复后,单独复检:');
+      console.log(`[audit]   bun ${relPath('audit.ts')} ${args.mdPath} <draftUrlFragment>`);
+    }
 
     await snapshot(client, selectors, 'draft-ready');
     // Save a screenshot next to the markdown so positions can be eyeballed.
