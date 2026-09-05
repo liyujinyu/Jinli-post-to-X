@@ -434,34 +434,17 @@ async function fillBody(
  * for visual distinction. Method: open the 正文 block-type dropdown, click 引用.
  */
 async function applyBlockquote(client: CdpClient): Promise<boolean> {
-  // NOTE: use native JS .click() — CDP coordinate clicks proved unreliable here
-  // (the same click that missed the Write button picked 大标题 instead of 引用).
-  const opened = await client.eval<boolean>(`(() => {
-    const btns = [...document.querySelectorAll('button, [role="button"]')]
-      .filter(e => e.offsetParent !== null && (e.innerText || '').trim() === '正文');
-    if (!btns.length) return false;
-    btns[0].click();
+  // The editor toolbar exposes a direct quote toggle button. Use a native JS
+  // .click() — CDP coordinate clicks proved unreliable here (the same offset
+  // that missed the Write button picked the wrong menu item).
+  const clicked = await client.eval<boolean>(`(() => {
+    const b = document.querySelector('[data-testid="btn-blockquote"]');
+    if (!b || b.offsetParent === null) return false;
+    b.click();
     return true;
   })()`);
-  if (!opened) return false;
-  await sleep(700);
-
-  const applied = await client.eval<boolean>(`(() => {
-    const els = [...document.querySelectorAll('[role="menuitem"], [role="option"], button, [role="button"], div[tabindex]')]
-      .filter(e => e.offsetParent !== null && (e.innerText || '').trim() === '引用');
-    if (!els.length) return false;
-    els[els.length - 1].click();
-    return true;
-  })()`);
-  if (!applied) {
-    // close the dropdown again
-    await client.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
-    await client.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
-    await sleep(300);
-    return false;
-  }
-  await sleep(500);
-  return true;
+  await sleep(450);
+  return clicked;
 }
 
 /**
