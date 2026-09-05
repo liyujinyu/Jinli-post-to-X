@@ -652,9 +652,14 @@ async function main() {
   const imageBlocks = article.blocks.filter(
     (b): b is Block & { kind: 'image' } => b.kind === 'image',
   );
+  const codeBlocks = article.blocks.filter(
+    (b): b is Block & { kind: 'code' } => b.kind === 'code',
+  );
   console.log(`  title: ${article.title}`);
   console.log(`  cover: ${article.coverImage ?? '(none)'}`);
-  console.log(`  blocks: ${article.blocks.length} (${imageBlocks.length} images)`);
+  console.log(
+    `  blocks: ${article.blocks.length} (${imageBlocks.length} images, ${codeBlocks.length} code)`,
+  );
 
   // Pre-flight: every image and cover must resolve to a real file. Catches
   // bad paths early with a clear message instead of failing deep in PowerShell.
@@ -685,6 +690,9 @@ async function main() {
     await createDraft(client, selectors);
     await fillTitle(client, article.title, selectors);
     await fillBody(client, article.blocks, selectors, path.basename(args.profileDir));
+    if (codeBlocks.length) {
+      await insertCodeBlocks(client, codeBlocks, selectors, path.basename(args.profileDir));
+    }
     if (imageBlocks.length && !args.noImages) {
       await insertImages(client, imageBlocks, selectors, path.basename(args.profileDir));
     } else if (imageBlocks.length) {
