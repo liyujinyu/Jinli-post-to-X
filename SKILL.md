@@ -1,6 +1,6 @@
 ---
 name: Jinli-post-to-X
-description: 把一篇带封面+正文配图的 X Article 长文自动「装配」到 X 草稿箱(标题/正文/正文配图按位置插入/封面),不自动发布,留给作者手动点发布。触发词:发X长文、X Article、X正文配图、把这篇发到X、装配X草稿、Jinli发X。用 CDP + OS 级 SendKeys 驱动真实 Chrome。
+description: 把一篇带封面+正文配图+代码块的 X Article 长文自动「装配」到 X 草稿箱(标题/正文/正文配图按位置插入/代码块原生格式/封面),不自动发布,留给作者手动点发布。触发词:发X长文、X Article、X正文配图、把这篇发到X、装配X草稿、Jinli发X。用 CDP + OS 级 SendKeys 驱动真实 Chrome。
 ---
 
 # Jinli-post-to-X
@@ -63,7 +63,7 @@ bun "${SKILL_DIR}/scripts/publish.ts" "创作输出/我的长文.md" --port 9222
 | `${SKILL_DIR}/scripts/publish.ts` | 编排 | CLI 入口,串联全流程,停在草稿,每步打快照 |
 | `${SKILL_DIR}/scripts/cdp.ts` | 稳定 | 裸 WebSocket CDP(连/eval/坐标点击/insertText/截图)|
 | `${SKILL_DIR}/scripts/os-clipboard.ts` | 稳定 | OS 级:写图剪贴板 + 激活窗口(AttachThreadInput)+ SendKeys + `pasteImage`(原子删+粘)|
-| `${SKILL_DIR}/scripts/markdown.ts` | 稳定 | 无依赖解析:frontmatter + 段落 + 图片占位符(首图自动提为封面)|
+| `${SKILL_DIR}/scripts/markdown.ts` | 稳定 | 无依赖解析:frontmatter + 段落 + 图片/代码块占位符(首图自动提为封面)|
 | `${SKILL_DIR}/scripts/package.json` | — | 无外部依赖 |
 
 ## 关键设计(改之前必读)
