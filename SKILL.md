@@ -1,6 +1,6 @@
 ---
 name: Jinli-post-to-X
-description: 把一篇带封面+正文配图+代码块的 X Article 长文自动「装配」到 X 草稿箱(标题/正文/正文配图按位置插入/代码块原生格式/封面),不自动发布,留给作者手动点发布。触发词:发X长文、X Article、X正文配图、把这篇发到X、装配X草稿、Jinli发X。用 CDP + OS 级 SendKeys 驱动真实 Chrome。
+description: 把一篇带封面+正文配图+代码块的 X Article 长文自动「装配」到 X 草稿箱(标题/正文/正文配图按位置插入/代码块以引用样式保留换行/封面),不自动发布,留给作者手动点发布。触发词:发X长文、X Article、X正文配图、把这篇发到X、装配X草稿、Jinli发X。用 CDP + OS 级 SendKeys 驱动真实 Chrome。
 ---
 
 # Jinli-post-to-X
