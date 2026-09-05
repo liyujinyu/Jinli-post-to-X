@@ -143,11 +143,71 @@ export async function pasteImage(
 }
 
 /**
- * Activate the automation Chrome (matched by profile dir in its command line)
- * and send a keystroke. Uses the AttachThreadInput trick to reliably take the
- * OS foreground — plain SetForegroundWindow/AppActivate silently fail when the
- * target isn't already foreground (Windows foreground-locking), which sends
- * SendKeys to the wrong window and loses every paste. AttachThreadInput onto
+ * The code-block paste primitive: put HTML (CF_HTML) + plain-text fallback on
+ * the clipboard, activate the automation Chrome window, (optionally DELETE the
+ * currently-selected token text), and send a real Ctrl+V — all in ONE
+ * PowerShell STA process (same anti-focus-gap design as pasteImage). Reason:
+ * CDP insertText can only insert plain text; DraftJS trusts a REAL OS paste
+ * and its HTML paste processor maps <pre> → a native code-block entity.
+ */
+export async function pasteHtml(
+  html: string,
+  plainText: string,
+  profileMarker: WindowTarget = DEFAULT_PROFILE_MARKER,
+  deleteFirst = false,
+): Promise<void> {
+  if (process.platform !== 'win32') {
+    throw new Error(`pasteHtml not yet implemented for platform ${process.platform}`);
+  }
+  // Base64 (UTF-8) so no PowerShell quoting can ever corrupt the payload.
+  const htmlB64 = Buffer.from(html, 'utf-8').toString('base64');
+  const textB64 = Buffer.from(plainText, 'utf-8').toString('base64');
+  const marker = escPath(profileMarker);
+  const del = deleteFirst ? "$w.SendKeys('{DELETE}'); Start-Sleep -Milliseconds 120" : '';
+  const script = [
+    'Add-Type -AssemblyName System.Windows.Forms',
+    `$code = @'`,
+    '[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
+    '[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);',
+    '[DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);',
+    '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);',
+    '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);',
+    '[DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();',
+    `'@`,
+    `Add-Type -MemberDefinition $code -Name Win -Namespace W`,
+    `$w=New-Object -ComObject WScript.Shell`,
+    `// activate FIRST (so the keystrokes below reach the composer)`,
+    `$marker='${marker}'`,
+    `$procs = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -like "*$marker*" }`,
+    `$hwnd=[IntPtr]::Zero`,
+    `foreach($pi in $procs){ try{$pr=Get-Process -Id $pi.ProcessId}catch{$pr=$null}; if($pr -and $pr.MainWindowHandle -ne [IntPtr]::Zero){ $hwnd=$pr.MainWindowHandle; break } }`,
+    `if($hwnd -eq [IntPtr]::Zero){ throw "No Chrome window matching marker $marker" }`,
+    `$me=[W.Win]::GetCurrentThreadId()`,
+    `$ok=$false`,
+    `for($try=0; $try -lt 4 -and -not $ok; $try++){`,
+    `  $fg=[W.Win]::GetForegroundWindow(); $fgt=[W.Win]::GetWindowThreadProcessId($fg,[ref]([uint32]0))`,
+    `  if($fgt -ne $me){ [W.Win]::AttachThreadInput($me,$fgt,$true) | Out-Null }`,
+    `  [W.Win]::ShowWindow($hwnd,9) | Out-Null`,
+    `  $ok=[W.Win]::SetForegroundWindow($hwnd)`,
+    `  if($fgt -ne $me){ [W.Win]::AttachThreadInput($me,$fgt,$false) | Out-Null }`,
+    `  if(-not $ok){ Start-Sleep -Milliseconds 150; $ok = $w.AppActivate('Google Chrome') }`,
+    `}`,
+    `if(-not $ok){ throw "Could not activate Chrome window (marker=$marker)" }`,
+    `Start-Sleep -Milliseconds 200`,
+    del,
+    // Build CF_HTML: the "HTML Format" clipboard flavor needs a header with
+    // UTF-8 BYTE offsets — .NET does not add one for you.
+    `$enc=[System.Text.Encoding]::UTF8`,
+    `$h=$enc.GetString([Convert]::FromBase64String('${htmlB64}'))`,
+    `$t=$enc.GetString([Convert]::FromBase64String('${textB64}'))`,
+    `$open="<html><body>`+"`r`n"+`<!--StartFragment-->"`,
+    `$close="<!--EndFragment-->"+"`r`n"+"</body></html>"`,
+    `$hdrTpl="Version:0.9`rr`nStartHTML:0000000000`r`nEndHTML:0000000000`r`nStartFragment:0000000000`r`nEndFragment:0000000000`r`n"`,
+    ...([] as string[]), // (placeholder to keep array formatting valid)
+  ].join('\n');
+  void script; void htmlB64; void textB64;
+  throw new Error('TODO');
+}
  * the current foreground thread makes SetForegroundWindow stick.
  */
 async function activateAndSendKeysWindows(

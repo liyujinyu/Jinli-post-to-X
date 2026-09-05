@@ -35,7 +35,8 @@ import path from 'node:path';
  */
 export type Block =
   | { kind: 'paragraph'; text: string }
-  | { kind: 'image'; path: string; raw: string; token: string };
+  | { kind: 'image'; path: string; raw: string; token: string }
+  | { kind: 'code'; lang: string; text: string; token: string };
 
 export type ParsedArticle = {
   title: string;
@@ -47,6 +48,11 @@ export type ParsedArticle = {
 /** Build a unique, ASCII-only placeholder token for image #`i` (1-based). */
 export function imageToken(i: number): string {
   return `XAP-IMG-${i}-PLACEHOLDER`;
+}
+
+/** Build a unique, ASCII-only placeholder token for code block #`i` (1-based). */
+export function codeToken(i: number): string {
+  return `XAP-CODE-${i}-PLACEHOLDER`;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,8 +181,41 @@ export function parseArticle(mdPath: string): ParsedArticle {
     pendingParagraph = '';
   };
 
+  // Fenced code blocks: lines between ``` fences become ONE code block with
+  // newlines preserved (NOT folded into a paragraph — that would destroy the
+  // formatting, which is the whole point of a code block).
+  let inCode = false;
+  let codeLang = '';
+  let codeLines: string[] = [];
+  let codeCount = 0;
+
   for (const rawLine of bodyLines) {
     const line = rawLine;
+
+    // Fence open/close: ``` or ```lang … ```
+    const fence = line.trim().match(/^```\s*(\S*)\s*$/);
+    if (fence) {
+      if (!inCode) {
+        flushParagraph();
+        inCode = true;
+        codeLang = fence[1] ?? '';
+        codeLines = [];
+      } else {
+        inCode = false;
+        codeCount++;
+        blocks.push({
+          kind: 'code',
+          lang: codeLang,
+          text: codeLines.join('\n'),
+          token: codeToken(codeCount),
+        });
+      }
+      continue;
+    }
+    if (inCode) {
+      codeLines.push(line);
+      continue;
+    }
 
     // Skip a single leading H1 that duplicates the title (only the FIRST
     // heading in the document is dropped; later headings become plain text
@@ -211,6 +250,16 @@ export function parseArticle(mdPath: string): ParsedArticle {
     pendingParagraph += (pendingParagraph ? ' ' : '') + line.trim();
   }
   flushParagraph();
+  // Unterminated fence (missing closing ```): keep the code, don't drop it.
+  if (inCode && codeLines.length) {
+    codeCount++;
+    blocks.push({
+      kind: 'code',
+      lang: codeLang,
+      text: codeLines.join('\n'),
+      token: codeToken(codeCount),
+    });
+  }
 
   const firstText = blocks.find((b) => b.kind === 'paragraph');
   const title = (fm.title ?? (firstText && firstText.text) ?? 'Untitled').trim();
