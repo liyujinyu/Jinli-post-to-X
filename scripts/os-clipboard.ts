@@ -159,11 +159,36 @@ export async function pasteHtml(
   if (process.platform !== 'win32') {
     throw new Error(`pasteHtml not yet implemented for platform ${process.platform}`);
   }
-  // Base64 (UTF-8) so no PowerShell quoting can ever corrupt the payload.
+  // Base64 (UTF-8) payloads so no PowerShell quoting can ever corrupt them.
   const htmlB64 = Buffer.from(html, 'utf-8').toString('base64');
   const textB64 = Buffer.from(plainText, 'utf-8').toString('base64');
   const marker = escPath(profileMarker);
   const del = deleteFirst ? "$w.SendKeys('{DELETE}'); Start-Sleep -Milliseconds 120" : '';
+
+  // CF_HTML needs a header with UTF-8 BYTE offsets; .NET does not add one for
+  // you. Backtick escapes below are single-quoted TS strings, so they reach
+  // PowerShell verbatim (PS treats `r`n as CRLF).
+  const cfHtmlLines = [
+    `$h=$enc.GetString([Convert]::FromBase64String('${htmlB64}'))`,
+    `$t=$enc.GetString([Convert]::FromBase64String('${textB64}'))`,
+    '$open="<html><body>`r`n<!--StartFragment-->"',
+    '$close="<!--EndFragment-->`r`n</body></html>"',
+    '$hdrTpl="Version:0.9`r`nStartHTML:0000000000`r`nEndHTML:0000000000`r`nStartFragment:0000000000`r`nEndFragment:0000000000`r`n"',
+    '$sH=$enc.GetByteCount($hdrTpl)',
+    '$sF=$sH+$enc.GetByteCount($open)',
+    '$eF=$sF+$enc.GetByteCount($h)',
+    '$eH=$eF+$enc.GetByteCount($close)',
+    '$hdr=("Version:0.9`r`nStartHTML:{0:D10}`r`nEndHTML:{1:D10}`r`nStartFragment:{2:D10}`r`nEndFragment:{3:D10}`r`n" -f $sH,$eH,$sF,$eF)',
+    '$cf=$hdr+$open+$h+$close',
+    '$d=New-Object System.Windows.Forms.DataObject',
+    '$d.SetText($t,[System.Windows.Forms.TextDataFormat]::UnicodeText)',
+    '$d.SetText($cf,[System.Windows.Forms.TextDataFormat]::Html)',
+    '[System.Windows.Forms.Clipboard]::SetDataObject($d,$true)',
+    'Start-Sleep -Milliseconds 200',
+    "$w.SendKeys('^v')",
+    'Start-Sleep -Milliseconds 150',
+  ];
+
   const script = [
     'Add-Type -AssemblyName System.Windows.Forms',
     `$code = @'`,
@@ -176,7 +201,6 @@ export async function pasteHtml(
     `'@`,
     `Add-Type -MemberDefinition $code -Name Win -Namespace W`,
     `$w=New-Object -ComObject WScript.Shell`,
-    `// activate FIRST (so the keystrokes below reach the composer)`,
     `$marker='${marker}'`,
     `$procs = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -like "*$marker*" }`,
     `$hwnd=[IntPtr]::Zero`,
@@ -195,19 +219,18 @@ export async function pasteHtml(
     `if(-not $ok){ throw "Could not activate Chrome window (marker=$marker)" }`,
     `Start-Sleep -Milliseconds 200`,
     del,
-    // Build CF_HTML: the "HTML Format" clipboard flavor needs a header with
-    // UTF-8 BYTE offsets — .NET does not add one for you.
-    `$enc=[System.Text.Encoding]::UTF8`,
-    `$h=$enc.GetString([Convert]::FromBase64String('${htmlB64}'))`,
-    `$t=$enc.GetString([Convert]::FromBase64String('${textB64}'))`,
-    `$open="<html><body>`+"`r`n"+`<!--StartFragment-->"`,
-    `$close="<!--EndFragment-->"+"`r`n"+"</body></html>"`,
-    `$hdrTpl="Version:0.9`rr`nStartHTML:0000000000`r`nEndHTML:0000000000`r`nStartFragment:0000000000`r`nEndFragment:0000000000`r`n"`,
-    ...([] as string[]), // (placeholder to keep array formatting valid)
+    '$enc=[System.Text.Encoding]::UTF8',
+    ...cfHtmlLines,
   ].join('\n');
-  void script; void htmlB64; void textB64;
-  throw new Error('TODO');
+  await runPowerShell(script);
 }
+
+/**
+ * Activate the automation Chrome (matched by profile dir in its command line)
+ * and send a keystroke. Uses the AttachThreadInput trick to reliably take the
+ * OS foreground — plain SetForegroundWindow/AppActivate silently fail when the
+ * target isn't already foreground (Windows foreground-locking), which sends
+ * SendKeys to the wrong window and loses every paste. AttachThreadInput onto
  * the current foreground thread makes SetForegroundWindow stick.
  */
 async function activateAndSendKeysWindows(

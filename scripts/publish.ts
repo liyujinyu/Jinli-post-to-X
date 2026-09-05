@@ -25,7 +25,7 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 import { connect, CdpClient, sleep } from './cdp.ts';
-import { copyImage, paste, deleteSelection, pasteImage } from './os-clipboard.ts';
+import { copyImage, paste, deleteSelection, pasteImage, pasteHtml } from './os-clipboard.ts';
 import { parseArticle, type Block } from './markdown.ts';
 
 /** Resolve a path relative to this script file (works on Bun and Node). */
@@ -396,7 +396,8 @@ async function fillBody(
 ): Promise<void> {
   const paras = blocks.filter((b) => b.kind === 'paragraph').length;
   const imgs = blocks.filter((b) => b.kind === 'image').length;
-  console.log(`\n=== fillBody inline (${paras} paragraphs, ${imgs} images) ===`);
+  const codes = blocks.filter((b) => b.kind === 'code').length;
+  console.log(`\n=== fillBody inline (${paras} paragraphs, ${imgs} images, ${codes} code blocks) ===`);
 
   // Focus the composer first so insertText goes to the editor, not the title.
   await client.eval(
@@ -421,8 +422,65 @@ async function fillBody(
     if (i < blocks.length - 1) await client.pressKey(13, 'Enter', 'Enter');
     await sleep(120);
   }
-  console.log(`  body typed (${paras} paragraphs + ${imgs} tokens)`);
+  console.log(`  body typed (${paras} paragraphs + ${imgs} img tokens + ${codes} code tokens)`);
   await snapshot(client, selectors, 'fillBody:after');
+}
+
+/**
+ * Phase 1.5: replace each code token with a REAL code block, in document
+ * order. Same paste-replace mechanism as images: highlight the token via the
+ * Selection API, then ONE atomic OS call deletes the token and Ctrl+V pastes
+ * clipboard HTML. The clipboard carries <pre><code> as CF_HTML (plus a
+ * plain-text fallback), so DraftJS's paste processor maps it to its native
+ * code-block entity — something insertText can never produce (it would fold
+ * every line into one plain paragraph).
+ */
+async function insertCodeBlocks(
+  client: CdpClient,
+  codeBlocks: Block[],
+  selectors: Selectors,
+  profileMarker: string,
+): Promise<void> {
+  console.log(`\n=== insertCodeBlocks (${codeBlocks.length}, paste-replace tokens) ===`);
+  const escHtml = (t: string) =>
+    t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  let ok = 0;
+  for (let i = 0; i < codeBlocks.length; i++) {
+    const cb = codeBlocks[i] as Extract<Block, { kind: 'code' }>;
+    const html = `<pre><code>${escHtml(cb.text)}</code></pre>`;
+    console.log(`- token[${i + 1}] ${cb.token} ← ${cb.lang || 'text'} (${cb.text.split('\n').length} lines)`);
+
+    const pos = await client.eval<{ ok: boolean; reason?: string }>(
+      selectTokenExpr(cb.token, selectors),
+    );
+    if (!pos?.ok) {
+      console.warn(`  ! token not found (${pos?.reason}); skipping`);
+      continue;
+    }
+
+    await client.bringToFront();
+    await sleep(i === 0 ? 600 : 250);
+    // Atomic: activate → {DELETE} removes the highlighted token → load HTML
+    // clipboard → Ctrl+V. DraftJS replaces the selection with the pasted
+    // <pre>, i.e. a native code block at the exact token position.
+    await pasteHtml(html, cb.text, profileMarker, true);
+    await sleep(400);
+
+    // Verify the token is gone (the paste consumed it).
+    const gone = await client.eval<boolean>(
+      `(() => { const c = document.querySelector(${JSON.stringify(
+        selectors.composer,
+      )}); return !(c && (c.innerText || '').includes(${JSON.stringify(cb.token)})); })()`,
+    );
+    if (gone) {
+      ok++;
+      console.log(`  ✓ code block replaced token`);
+    } else {
+      console.warn(`  ! token still present — paste may have failed`);
+    }
+  }
+  console.log(`  code blocks inserted: ${ok}/${codeBlocks.length}`);
+  await snapshot(client, selectors, 'insertCodeBlocks:after');
 }
 
 /**
