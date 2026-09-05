@@ -274,11 +274,41 @@ function selectTokenExpr(token: string, selectors: Selectors): string {
         sel.addRange(range);
         const ce = composer.querySelector(${JSON.stringify(selectors.contentEditable)}) || composer;
         if (ce.focus) ce.focus();
-        return { ok: true };
+        // Report whether the DOM selection actually holds the token. DraftJS
+        // syncs its internal selection from selectionchange ASYNC — callers
+        // must wait (and re-verify) before insertText / OS-paste, or the edit
+        // lands at a stale internal position and corrupts the document.
+        const held = sel.toString() === tok;
+        return { ok: true, held };
       }
     }
     return { ok: false, reason: 'token-not-found' };
   })()`;
+}
+
+/**
+ * Select a token and CONFIRM the DOM selection holds it before any edit.
+ * Retries (select → focus → wait) because DraftJS consumes selectionchange
+ * asynchronously; editing before the sync is what corrupts blocks.
+ */
+async function selectTokenVerified(
+  client: CdpClient,
+  token: string,
+  selectors: Selectors,
+  tries = 4,
+): Promise<boolean> {
+  for (let i = 0; i < tries; i++) {
+    const r = await client.eval<{ ok: boolean; held?: boolean; reason?: string }>(
+      selectTokenExpr(token, selectors),
+    );
+    if (r?.ok && r.held) {
+      await sleep(350); // let selectionchange propagate to DraftJS
+      const still = await client.eval<string>('window.getSelection().toString()');
+      if (still === token) return true;
+    }
+    await sleep(300);
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -320,14 +350,18 @@ async function createDraft(client: CdpClient, selectors: Selectors): Promise<voi
     return;
   }
 
-  // Find the "Write" button. When the article list is empty it's
-  // empty_state_button_text; once drafts exist the button moves but keeps the
-  // label "Write" / "写文章". Try testid first, then text, then any link to a
-  // fresh compose URL.
-  let clicked = await clickSelector(client, selectors.emptyStateWrite);
+  // Find the "Write" button. JS native .click() — CDP coordinate clicks were
+  // systematically unreliable here (missed the button entirely). Try testid,
+  // then visible text, then any link to a fresh compose URL.
+  let clicked = await client.eval<boolean>(
+    `(() => { const b = document.querySelector(${JSON.stringify(selectors.emptyStateWrite)}); if (b) { b.click(); return true } return false })()`,
+  );
+  if (clicked) console.log('[createDraft] Clicked Write by testid (JS)');
   if (!clicked) {
-    clicked = await clickTextButton(client, ['Write', '写文章', '寫文章', '記事を書く']);
-    if (clicked) console.log('[createDraft] Clicked Write by text');
+    clicked = await client.eval<boolean>(
+      `(() => { const b = [...document.querySelectorAll('button, a')].find(x => ['撰写','Write','写文章','寫文章','記事を書く'].includes((x.innerText || '').trim())); if (b) { b.click(); return true } return false })()`,
+    );
+    if (clicked) console.log('[createDraft] Clicked Write by text (JS)');
   }
   if (!clicked) {
     // Last resort: an anchor that starts a new article.
@@ -342,8 +376,15 @@ async function createDraft(client: CdpClient, selectors: Selectors): Promise<voi
     );
   }
 
-  // Wait for the editor (title textarea appears on the edit/<id> page).
-  const editorReady = await client.waitFor(titlePresent, 40_000);
+  // Wait for the editor: URL moves to /edit/<id> AND the composer mounts.
+  // (Waiting on the title textarea alone produced false negatives — the draft
+  // was created but the placeholder-based selector didn't match.)
+  const editorReady = await client.waitFor(
+    `/compose\\/articles\\/edit\\//.test(location.href) && !!document.querySelector(${JSON.stringify(
+      selectors.composer,
+    )})`,
+    40_000,
+  );
   if (!editorReady) {
     throw new Error(
       'Editor did not open after clicking Write. If this is the first run, sign in to X in the Chrome window, then re-run.',
@@ -397,7 +438,11 @@ async function fillBody(
   const paras = blocks.filter((b) => b.kind === 'paragraph').length;
   const imgs = blocks.filter((b) => b.kind === 'image').length;
   const codes = blocks.filter((b) => b.kind === 'code').length;
-  console.log(`\n=== fillBody inline (${paras} paragraphs, ${imgs} images, ${codes} code blocks) ===`);
+  const heads = blocks.filter((b) => b.kind === 'heading').length;
+  const lists = blocks.filter((b) => b.kind === 'listitem').length;
+  console.log(
+    `\n=== fillBody inline (${paras} paragraphs, ${heads} headings, ${lists} list items, ${imgs} images, ${codes} code blocks) ===`,
+  );
 
   // Focus the composer first so insertText goes to the editor, not the title.
   await client.eval(
@@ -409,21 +454,273 @@ async function fillBody(
   );
   await sleep(300);
 
-  // Phase 1: type the WHOLE article first — paragraphs become text, image
-  // positions become a UNIQUE placeholder token paragraph. This uploads the
-  // complete article up front (so nothing is half-done) and bakes each image's
-  // exact spot into the text as a locatable token. Phase 2 (insertImages) then
-  // selects each token and paste-replaces it with the real image.
-  let imgInserted = 0;
+  // Phase 1: type the WHOLE article first — paragraphs become text (links and
+  // bold/italic are styled right after their paragraph is typed), headings and
+  // list items become a UNIQUE placeholder token (styled + text-swapped later
+  // by applyBlockStyles), image positions become a placeholder token too.
   for (let i = 0; i < blocks.length; i++) {
     const b = blocks[i];
-    const content = b.kind === 'paragraph' ? b.text : b.token;
+    const content =
+      b.kind === 'paragraph' || b.kind === 'heading' || b.kind === 'listitem'
+        ? b.kind === 'paragraph'
+          ? b.text
+          : b.token
+        : b.token;
     await client.insertText(content);
-    if (i < blocks.length - 1) await client.pressKey(13, 'Enter', 'Enter');
     await sleep(120);
+    if (b.kind === 'paragraph') await applyInlineRuns(client, b, selectors);
+    if (i < blocks.length - 1) await client.pressKey(13, 'Enter', 'Enter');
+    await sleep(80);
   }
-  console.log(`  body typed (${paras} paragraphs + ${imgs} img tokens + ${codes} code tokens)`);
+  console.log(
+    `  body typed (${paras} paragraphs + ${heads} heading tokens + ${lists} list tokens + ${imgs} img tokens + ${codes} code tokens)`,
+  );
   await snapshot(client, selectors, 'fillBody:after');
+}
+
+/**
+ * Select an exact text range inside the block whose textContent equals
+ * `blockText`, then focus the contenteditable so DraftJS honors the selection
+ * for toolbar actions. `prefix` + `run.text` locates the right occurrence.
+ */
+function selectRunExpr(
+  blockText: string,
+  prefix: string,
+  runText: string,
+  selectors: Selectors,
+): string {
+  return `(() => {
+    const composer = document.querySelector(${JSON.stringify(selectors.composer)});
+    if (!composer) return { ok: false, reason: 'no-composer' };
+    const blocks = [...composer.querySelectorAll('[data-block="true"]')];
+    const full = ${JSON.stringify(blockText)};
+    let b = blocks.find(x => (x.textContent || '') === full);
+    if (!b) b = blocks.find(x => (x.textContent || '').startsWith(full.slice(0, 25)));
+    if (!b) return { ok: false, reason: 'block-not-found' };
+    b.scrollIntoView({ block: 'center' });
+    // Walk ALL text nodes in the block — after a link/bold is applied the
+    // block contains several spans, so a single span[data-text] lookup misses.
+    const walker = document.createTreeWalker(b, NodeFilter.SHOW_TEXT, null, false);
+    const probe = ${JSON.stringify(prefix + runText)};
+    const run = ${JSON.stringify(runText)};
+    let node;
+    while ((node = walker.nextNode())) {
+      const t = node.textContent || '';
+      let idx = t.indexOf(probe);
+      if (idx >= 0) idx += probe.length - run.length;
+      else idx = t.indexOf(run);
+      if (idx >= 0 && idx + run.length <= t.length) {
+        const range = document.createRange();
+        range.setStart(node, idx);
+        range.setEnd(node, idx + run.length);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        const ce = b.closest('[contenteditable="true"]') || composer.querySelector(${JSON.stringify(selectors.contentEditable)});
+        if (ce && ce.focus) ce.focus();
+        return { ok: true, held: sel.toString() === run };
+      }
+    }
+    return { ok: false, reason: 'run-not-found' };
+  })()`;
+}
+
+/**
+ * Style the link / bold / italic runs of a JUST-TYPED paragraph: select the
+ * exact range in the block, click the toolbar control. Links go through the
+ * link dialog (two inputs + 插入 button; the display-text input is the one
+ * prefilled with the selection, the other is the URL).
+ */
+async function applyInlineRuns(
+  client: CdpClient,
+  p: Extract<Block, { kind: 'paragraph' }>,
+  selectors: Selectors,
+): Promise<void> {
+  const styled = p.runs.filter((r) => r.url || r.bold || r.italic);
+  if (!styled.length) return;
+  let prefix = '';
+  for (const r of p.runs) {
+    if (r === styled[0]) break;
+    prefix += r.text;
+  }
+  for (const r of styled) {
+    // select + verify + wait for the async DraftJS selectionchange sync
+    let selOk = false;
+    for (let attempt = 0; attempt < 3 && !selOk; attempt++) {
+      const sel = await client.eval<{ ok: boolean; held?: boolean; reason?: string }>(
+        selectRunExpr(p.text, prefix, r.text, selectors),
+      );
+      if (sel?.ok && sel.held) {
+        await sleep(350);
+        if ((await client.eval<string>('window.getSelection().toString()')) === r.text) selOk = true;
+      }
+      if (!selOk) await sleep(300);
+    }
+    if (!selOk) {
+      console.warn(`  ! run select failed: ${r.text.slice(0, 20)}`);
+      prefix += r.text;
+      continue;
+    }
+    if (r.url) {
+      await client.eval(`document.querySelector('[data-testid="btn-link"]')?.click(); true`);
+      const dialogGone = await client.waitFor(`!document.querySelector('[role="dialog"]')`, 2000).catch(() => true);
+      void dialogGone;
+      const opened = await client.waitFor(`!!document.querySelector('[role="dialog"] input')`, 3000);
+      if (!opened) {
+        console.warn(`  ! link dialog did not open for: ${r.text.slice(0, 20)}`);
+        continue;
+      }
+      await sleep(350);
+      // Identify the URL input: the display-text input is prefilled with the
+      // selected text; the other one is the URL field.
+      const filled = await client.eval<{ ok: boolean; urlIdx?: number }>(`(() => {
+        const dlg = document.querySelector('[role="dialog"]');
+        if (!dlg) return { ok: false };
+        const ins = [...dlg.querySelectorAll('input')];
+        if (ins.length < 2) return { ok: false };
+        const selText = ${JSON.stringify(r.text)};
+        let urlIdx = ins.findIndex(i => i.value !== selText);
+        if (urlIdx < 0) urlIdx = 1;
+        const set = (el, v) => {
+          const pr = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+          pr.call(el, v);
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        };
+        set(ins[1 - urlIdx], selText);
+        set(ins[urlIdx], ${JSON.stringify(r.url)});
+        return { ok: ins[urlIdx].value === ${JSON.stringify(r.url)} };
+      })()`);
+      if (!filled?.ok) {
+        console.warn(`  ! link URL field fill not confirmed for: ${r.text.slice(0, 20)}`);
+        await client.eval(`document.querySelector('[data-testid="app-bar-close"]')?.click(); true`);
+        await sleep(300);
+        prefix += r.text;
+        continue;
+      }
+      await sleep(300);
+      await client.eval(`(() => {
+        const dlg = document.querySelector('[role="dialog"]');
+        if (!dlg) return false;
+        const b = [...dlg.querySelectorAll('button')].find(x => (x.innerText || '').trim() === '插入');
+        if (!b) return false;
+        b.click(); return true;
+      })(); true`);
+      const closed = await client.waitFor(`!document.querySelector('[role="dialog"]')`, 5000).catch(() => false);
+      const hrefOk = await client.eval<boolean>(
+        `!!document.querySelector(${JSON.stringify(selectors.composer)} a[href=${JSON.stringify(r.url)}])`,
+      ).catch(() => false);
+      if (closed || hrefOk) console.log(`  ✓ link applied: ${r.text.slice(0, 25)} → ${r.url.slice(0, 40)}`);
+      else console.warn(`  ! link apply unverified: ${r.text.slice(0, 25)}`);
+    } else {
+      const tid = r.bold ? 'btn-bold' : 'btn-italic';
+      await client.eval(`(() => { const b = document.querySelector('[data-testid="${tid}"]'); if (b && b.offsetParent !== null) { b.click(); return true } return false })()`);
+      await sleep(300);
+      console.log(`  ✓ ${r.bold ? 'bold' : 'italic'} applied: ${r.text.slice(0, 25)}`);
+    }
+    prefix += r.text;
+  }
+}
+
+/**
+ * Style heading / list-item token blocks: caret into the token block (token
+ * still selected via selectTokenExpr), apply the block style, then swap the
+ * token for the real text. Headings: ## → 标题 (header-one), ### → 副标题
+ * (header-two) via the 正文 dropdown (whose button label mirrors the current
+ * block type, so match any of 正文/标题/副标题). Lists: btn-ul / btn-ol.
+ */
+async function applyBlockStyles(
+  client: CdpClient,
+  blocks: Block[],
+  selectors: Selectors,
+): Promise<void> {
+  type StyleTarget = Extract<Block, { kind: 'heading' | 'listitem' }>;
+  const targets = blocks.filter(
+    (b): b is StyleTarget => b.kind === 'heading' || b.kind === 'listitem',
+  );
+  if (!targets.length) return;
+  console.log(`\n=== applyBlockStyles (${targets.length} heading/list blocks) ===`);
+  let ok = 0;
+  for (let i = 0; i < targets.length; i++) {
+    const b = targets[i]!;
+    const label = b.kind === 'heading' ? (b.level <= 2 ? '标题' : '副标题') : null;
+    console.log(`- [${i + 1}] ${b.kind}${b.kind === 'heading' ? b.level : b.ordered ? '(ol)' : '(ul)'}: ${b.text.slice(0, 30)}`);
+
+    // 1. select the token → caret inside the token block (focuses contenteditable)
+    const pos = await selectTokenVerified(client, b.token, selectors);
+    if (!pos) {
+      console.warn(`  ! token could not be verifiably selected; skipping`);
+      continue;
+    }
+    await sleep(200);
+
+    // 2. apply the block style to the current block
+    let styled = false;
+    if (label) {
+      await client.eval(`(() => {
+        const b = [...document.querySelectorAll('button')].find(x => ['正文','标题','副标题'].includes((x.innerText || '').trim()) && !x.dataset.testid);
+        if (b) { b.click(); return true } return false;
+      })(); true`);
+      const itemVisible = await client.waitFor(
+        `!![...document.querySelectorAll('[role="menuitem"]')].find(x => x.offsetParent !== null && (x.innerText || '').trim() === '${label}')`,
+        3000,
+      );
+      if (!itemVisible) {
+        console.warn(`  ! dropdown menu did not show ${label}`);
+        continue;
+      }
+      styled = await client.eval<boolean>(`(() => {
+        const it = [...document.querySelectorAll('[role="menuitem"]')].filter(e => e.offsetParent !== null).find(x => (x.innerText || '').trim() === '${label}');
+        if (!it) return false;
+        it.click(); return true;
+      })()`);
+    } else {
+      styled = await client.eval<boolean>(`(() => {
+        const tid = ${JSON.stringify(b.kind === 'listitem' && b.ordered ? 'btn-ol' : 'btn-ul')};
+        const b = document.querySelector('[data-testid="' + tid + '"]');
+        if (!b || b.offsetParent === null) return false;
+        b.click(); return true;
+      })()`);
+    }
+    await sleep(400);
+
+    // 3. swap token → real text (block keeps its new style). Verify the
+    // selection holds the token first — insertText at a stale DraftJS internal
+    // position corrupts a different block.
+    const sel2 = await selectTokenVerified(client, b.token, selectors);
+    if (!sel2) {
+      console.warn(`  ! token could not be verifiably selected before text swap; skipping`);
+      continue;
+    }
+    await client.insertText(b.text);
+    await sleep(300);
+
+    // 4. verify: token gone + block class changed from unstyled
+    const state = await client.eval<{ gone: boolean; cls: string }>(`(() => {
+      const c = document.querySelector(${JSON.stringify(selectors.composer)});
+      const gone = !(c && (c.innerText || '').includes(${JSON.stringify(b.token)}));
+      let cls = '';
+      if (c) {
+        const blk = [...c.querySelectorAll('[data-block="true"]')].find(x => (x.textContent || '').includes(${JSON.stringify(b.text.slice(0, 20))}));
+        if (blk) cls = blk.className;
+      }
+      return { gone, cls };
+    })()`);
+    const good =
+      state?.gone &&
+      styled &&
+      state.cls &&
+      (b.kind === 'heading'
+        ? state.cls.includes('header')
+        : state.cls !== 'longform-unstyled');
+    if (good) {
+      ok++;
+      console.log(`  ✓ styled (${state.cls})`);
+    } else {
+      console.warn(`  ! verify failed (styled=${styled}, cls=${state?.cls || '?'}, gone=${state?.gone})`);
+    }
+  }
+  console.log(`  blocks styled: ${ok}/${targets.length}`);
+  await snapshot(client, selectors, 'applyBlockStyles:after');
 }
 
 /**
@@ -466,45 +763,62 @@ async function insertCodeBlocks(
     const cb = codeBlocks[i] as Extract<Block, { kind: 'code' }>;
     console.log(`- token[${i + 1}] ${cb.token} ← ${cb.lang || 'text'} (${cb.text.split('\n').length} lines)`);
 
-    const pos = await client.eval<{ ok: boolean; reason?: string }>(
-      selectTokenExpr(cb.token, selectors),
-    );
-    if (!pos?.ok) {
-      console.warn(`  ! token not found (${pos?.reason}); skipping`);
-      continue;
-    }
+    let done = false;
+    for (let attempt = 0; attempt < 2 && !done; attempt++) {
+      const pos = await selectTokenVerified(client, cb.token, selectors);
+      if (!pos) {
+        console.warn(`  ! token could not be verifiably selected (attempt ${attempt + 1})`);
+        continue;
+      }
 
-    // Replace the highlighted token with the code text (keeps \n in-block).
-    await client.insertText(cb.text);
-    await sleep(250);
+      // Replace the highlighted token with the code text (keeps \n in-block).
+      await client.insertText(cb.text);
+      await sleep(350);
 
-    // Style the block as a blockquote while the caret is still in it.
-    const quoted = await applyBlockquote(client);
+      // Style the block as a blockquote while the caret is still in it.
+      const quoted = await applyBlockquote(client);
 
-    // Verify: token gone AND the block containing the first code line is no
-    // longer an unstyled paragraph.
-    const firstLine = cb.text.split('\n')[0]?.trim().slice(0, 30) ?? '';
-    const state = await client.eval<{ gone: boolean; cls: string }>(
-      `(() => {
-        const c = document.querySelector(${JSON.stringify(selectors.composer)});
-        const gone = !(c && (c.innerText || '').includes(${JSON.stringify(cb.token)}));
-        let cls = '';
-        if (c && ${JSON.stringify(firstLine)}) {
-          const b = [...c.querySelectorAll('[data-block="true"]')]
-            .find(x => (x.innerText || '').includes(${JSON.stringify(firstLine)}));
-          if (b) cls = b.className;
+      // Verify: token gone AND the block containing the first code line is a
+      // blockquote. Verify LATE — the class check right after the click races
+      // DraftJS re-renders (a verified false negative in an earlier run).
+      const firstLine = cb.text.split('\n')[0]?.trim().slice(0, 30) ?? '';
+      await sleep(500);
+      const state = await client.eval<{ gone: boolean; cls: string }>(
+        `(() => {
+          const c = document.querySelector(${JSON.stringify(selectors.composer)});
+          const gone = !(c && (c.innerText || '').includes(${JSON.stringify(cb.token)}));
+          let cls = '';
+          if (c && ${JSON.stringify(firstLine)}) {
+            const b = [...c.querySelectorAll('[data-block="true"]')]
+              .find(x => (x.innerText || '').includes(${JSON.stringify(firstLine)}));
+            if (b) cls = b.className;
+          }
+          return { gone, cls };
+        })()`,
+      );
+      if (state?.gone && quoted && state.cls && state.cls.includes('quote')) {
+        done = true;
+        console.log(`  ✓ code text inserted + quoted (${state.cls})`);
+      } else if (state?.gone) {
+        // Text landed but quote not confirmed — re-apply quote once.
+        const requoted = await applyBlockquote(client);
+        await sleep(500);
+        const cls2 = await client.eval<string>(
+          `(() => { const c = document.querySelector(${JSON.stringify(selectors.composer)});
+             const b = c && [...c.querySelectorAll('[data-block="true"]')].find(x => (x.innerText || '').includes(${JSON.stringify(firstLine)}));
+             return b ? b.className : ''; })()`,
+        );
+        if (cls2 && cls2.includes('quote')) {
+          done = true;
+          console.log(`  ✓ code text inserted + quoted on re-apply (${cls2}, click=${requoted})`);
+        } else if (attempt === 1) {
+          console.warn(`  ! quote NOT confirmed (cls=${cls2 || '?'})`);
         }
-        return { gone, cls };
-      })()`,
-    );
-    if (state?.gone && quoted && state.cls && state.cls.includes('quote')) {
-      ok++;
-      console.log(`  ✓ code text inserted + quoted (${state.cls})`);
-    } else if (state?.gone) {
-      console.warn(`  ! code text inserted but quote NOT confirmed (quoted=${quoted}, cls=${state.cls || '?'})`);
-    } else {
-      console.warn(`  ! token still present — insert may have failed`);
+      } else if (attempt === 1) {
+        console.warn(`  ! token still present — insert failed`);
+      }
     }
+    if (done) ok++;
   }
   console.log(`  code blocks inserted: ${ok}/${codeBlocks.length}`);
   await snapshot(client, selectors, 'insertCodeBlocks:after');
@@ -530,12 +844,12 @@ async function insertImages(
     const before = await countImgs(client, selectors);
     console.log(`- token[${i + 1}] ${im.token} ← ${path.basename(im.path)}`);
 
-    // Highlight the token text — the OS paste lands the image right at this spot.
-    const pos = await client.eval<{ ok: boolean; reason?: string }>(
-      selectTokenExpr(im.token, selectors),
-    );
-    if (!pos?.ok) {
-      console.warn(`  ! token not found (${pos?.reason}); skipping`);
+    // Highlight the token text AND verify the DOM selection holds it. A paste
+    // (or its {DELETE}) at a stale DraftJS internal selection is what corrupts
+    // neighbouring paragraphs — never paste unverified.
+    const pos = await selectTokenVerified(client, im.token, selectors);
+    if (!pos) {
+      console.warn(`  ! token could not be verifiably selected — SKIPPING paste to avoid corruption`);
       continue;
     }
 
@@ -549,34 +863,54 @@ async function insertImages(
     await pasteImage(im.path, profileMarker, true);
 
     const grew = `document.querySelectorAll(${JSON.stringify(selectors.composerImages)}).length > ${before}`;
-    const verify = async () => {
-      if (!(await client.waitFor(grew, 15_000, 250))) return false;
-      // Confirm the token text is actually gone (not just the image present).
-      const remaining = await client.eval<number>(
+    const tokenRemaining = async (): Promise<number> =>
+      client.eval<number>(
         `(document.querySelector(${JSON.stringify(selectors.composer)})?.textContent||'').split(${JSON.stringify(im.token)}).length - 1`,
       );
-      return remaining === 0;
+    const verify = async () => {
+      if (!(await client.waitFor(grew, 15_000, 250))) return false;
+      return (await tokenRemaining()) === 0;
     };
     if (await verify()) {
       ok++;
       console.log(`  ✓ image replaced token (${before} → ${await countImgs(client, selectors)})`);
     } else {
-      console.warn(`  ! retrying (image missing or token leftover)`);
-      await client.eval(selectTokenExpr(im.token, selectors)).catch(() => {});
-      await client.bringToFront();
-      await sleep(300);
-      await pasteImage(im.path, profileMarker, true);
-      if (await (async () => {
-        if (!(await client.waitFor(grew, 10_000, 250))) return false;
-        const remaining = await client.eval<number>(
-          `(document.querySelector(${JSON.stringify(selectors.composer)})?.textContent||'').split(${JSON.stringify(im.token)}).length - 1`,
-        );
-        return remaining === 0;
-      })()) {
-        ok++;
-        console.log(`  ✓ image replaced token on retry`);
+      const after = await countImgs(client, selectors);
+      const remaining = await tokenRemaining();
+      if (after > before && remaining > 0) {
+        // The image pasted but the token survived (the OS DELETE missed).
+        // Delete the token ONLY — re-pasting would duplicate the image.
+        console.warn(`  ! image pasted but token leftover — deleting token only`);
+        if (await selectTokenVerified(client, im.token, selectors)) {
+          await client.bringToFront();
+          await sleep(250);
+          await deleteSelection(2, profileMarker);
+          await sleep(400);
+          if ((await tokenRemaining()) === 0) {
+            ok++;
+            console.log(`  ✓ token removed after paste (image kept)`);
+          } else {
+            console.warn(`  ! token still leftover for ${path.basename(im.path)} — manual fix needed`);
+          }
+        } else {
+          console.warn(`  ! could not re-select token for ${path.basename(im.path)} — manual fix needed`);
+        }
       } else {
-        console.warn(`  ! gave up on ${path.basename(im.path)}`);
+        // No image grew — safe to retry the full paste-replace once.
+        console.warn(`  ! retrying (image missing)`);
+        if (await selectTokenVerified(client, im.token, selectors)) {
+          await client.bringToFront();
+          await sleep(300);
+          await pasteImage(im.path, profileMarker, true);
+          if (await verify()) {
+            ok++;
+            console.log(`  ✓ image replaced token on retry`);
+          } else {
+            console.warn(`  ! gave up on ${path.basename(im.path)}`);
+          }
+        } else {
+          console.warn(`  ! gave up on ${path.basename(im.path)} (token unselectable)`);
+        }
       }
     }
   }
@@ -720,6 +1054,8 @@ async function main() {
     if (codeBlocks.length) {
       await insertCodeBlocks(client, codeBlocks, selectors, path.basename(args.profileDir));
     }
+    // Headings + list items: style the token blocks, then swap in real text.
+    await applyBlockStyles(client, article.blocks, selectors);
     if (imageBlocks.length && !args.noImages) {
       await insertImages(client, imageBlocks, selectors, path.basename(args.profileDir));
     } else if (imageBlocks.length) {

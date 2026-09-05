@@ -33,8 +33,27 @@ import path from 'node:path';
  * finds each token, deletes it, and OS-pastes the image in its place — so the
  * image lands precisely where the author put it, with no text-matching guesswork.
  */
+/**
+ * Inline style run inside a paragraph. `text` is the visible text; the flags
+ * say how to restyle that exact range in the X editor after typing.
+ * - url     → make it a hyperlink (btn-link + dialog)
+ * - bold    → btn-bold
+ * - italic  → btn-italic
+ * - code    → rendered as plain text (backticks stripped) — X Articles has no
+ *             inline-code support, so we just drop the markers.
+ */
+export type InlineRun = {
+  text: string;
+  bold?: boolean;
+  italic?: boolean;
+  code?: boolean;
+  url?: string;
+};
+
 export type Block =
-  | { kind: 'paragraph'; text: string }
+  | { kind: 'paragraph'; text: string; runs: InlineRun[] }
+  | { kind: 'heading'; level: number; text: string; token: string }
+  | { kind: 'listitem'; ordered: boolean; text: string; token: string }
   | { kind: 'image'; path: string; raw: string; token: string }
   | { kind: 'code'; lang: string; text: string; token: string };
 
@@ -53,6 +72,48 @@ export function imageToken(i: number): string {
 /** Build a unique, ASCII-only placeholder token for code block #`i` (1-based). */
 export function codeToken(i: number): string {
   return `XAP-CODE-${i}-PLACEHOLDER`;
+}
+
+/** Token for heading #`i` (1-based) — typed first, styled, then text-swapped. */
+export function headingToken(i: number): string {
+  return `XAP-H-${i}-PLACEHOLDER`;
+}
+
+/** Token for list item #`i` (1-based). */
+export function listToken(i: number): string {
+  return `XAP-L-${i}-PLACEHOLDER`;
+}
+
+// ---------------------------------------------------------------------------
+// Inline runs (links / bold / italic / inline code)
+// ---------------------------------------------------------------------------
+
+/**
+ * Split a paragraph's raw markdown into styled runs. Markers are removed from
+ * the emitted text; the flags carry the styling for the editor phase.
+ */
+export function parseRuns(raw: string): InlineRun[] {
+  const runs: InlineRun[] = [];
+  // Order matters: bold before italic (so ** isn't read as two italics),
+  // links and code anywhere.
+  const re =
+    /\[([^\]]+)\]\(([^)\s]+)\)|\*\*([^*]+)\*\*|`([^`]+)`|(?<![\w*])\*([^*\s][^*]*?)\*(?![\w*])/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  const push = (r: InlineRun) => {
+    if (r.text) runs.push(r);
+  };
+  while ((m = re.exec(raw))) {
+    if (m.index > last) push({ text: raw.slice(last, m.index) });
+    if (m[1] !== undefined) push({ text: m[1], url: m[2] });
+    else if (m[3] !== undefined) push({ text: m[3], bold: true });
+    else if (m[4] !== undefined) push({ text: m[4], code: true });
+    else if (m[5] !== undefined) push({ text: m[5], italic: true });
+    last = m.index + m[0].length;
+  }
+  if (last < raw.length) push({ text: raw.slice(last) });
+  if (runs.length === 0) runs.push({ text: raw });
+  return runs;
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +156,7 @@ function stripInline(text: string): string {
     .replace(/\*\*(.+?)\*\*/g, '$1')
     .replace(/(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)/g, '$1')
     .replace(/__(.+?)__/g, '$1')
+    .replace(/`([^`]+)`/g, '$1') // inline code markers → plain text
     .trim();
 }
 
@@ -174,10 +236,15 @@ export function parseArticle(mdPath: string): ParsedArticle {
   let pendingParagraph = '';
   let sawFirstH1 = false;
   let imageCount = 0;
+  let headingCount = 0;
+  let listCount = 0;
 
   const flushParagraph = () => {
-    const text = stripInline(pendingParagraph);
-    if (text) blocks.push({ kind: 'paragraph', text });
+    const raw = pendingParagraph.trim();
+    if (raw) {
+      const runs = parseRuns(raw);
+      blocks.push({ kind: 'paragraph', text: runs.map((r) => r.text).join(''), runs });
+    }
     pendingParagraph = '';
   };
 
@@ -217,13 +284,39 @@ export function parseArticle(mdPath: string): ParsedArticle {
       continue;
     }
 
-    // Skip a single leading H1 that duplicates the title (only the FIRST
-    // heading in the document is dropped; later headings become plain text
-    // paragraphs with their # prefix stripped by stripInline).
-    if (!sawFirstH1 && /^#{1,6}\s+/.test(line.trim())) {
-      sawFirstH1 = true;
-      // Flush any pending text first so order is preserved.
+    // Headings: the FIRST heading in the document is dropped (it duplicates the
+    // frontmatter title). Every later heading becomes a heading block — X gets
+    // ## → 标题 (header-one), ### or deeper → 副标题 (header-two).
+    const head = line.trim().match(/^(#{1,6})\s+(.*)$/);
+    if (head) {
+      if (!sawFirstH1) {
+        sawFirstH1 = true;
+        flushParagraph();
+        continue;
+      }
       flushParagraph();
+      headingCount++;
+      blocks.push({
+        kind: 'heading',
+        level: head[1]!.length,
+        text: stripInline(head[2] ?? ''),
+        token: headingToken(headingCount),
+      });
+      continue;
+    }
+
+    // List items: each "- x" / "* x" / "1. x" line is its own block, later
+    // styled with btn-ul (unordered) or btn-ol (ordered).
+    const li = line.match(/^\s*(?:([-*])|(\d+\.))\s+(.*)$/);
+    if (li) {
+      flushParagraph();
+      listCount++;
+      blocks.push({
+        kind: 'listitem',
+        ordered: li[2] !== undefined,
+        text: stripInline(li[3] ?? ''),
+        token: listToken(listCount),
+      });
       continue;
     }
 
