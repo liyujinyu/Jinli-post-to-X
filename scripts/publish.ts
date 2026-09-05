@@ -25,7 +25,7 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 import { connect, CdpClient, sleep } from './cdp.ts';
-import { copyImage, paste, deleteSelection, pasteImage, pasteHtml } from './os-clipboard.ts';
+import { copyImage, paste, deleteSelection, pasteImage } from './os-clipboard.ts';
 import { parseArticle, type Block } from './markdown.ts';
 
 /** Resolve a path relative to this script file (works on Bun and Node). */
@@ -427,13 +427,47 @@ async function fillBody(
 }
 
 /**
- * Phase 1.5: replace each code token with a REAL code block, in document
- * order. Same paste-replace mechanism as images: highlight the token via the
- * Selection API, then ONE atomic OS call deletes the token and Ctrl+V pastes
- * clipboard HTML. The clipboard carries <pre><code> as CF_HTML (plus a
- * plain-text fallback), so DraftJS's paste processor maps it to its native
- * code-block entity — something insertText can never produce (it would fold
- * every line into one plain paragraph).
+ * Apply the 引用 (blockquote) style to the block the caret is currently in.
+ * X Articles has NO native code-block support (block menu: 正文/大标题/小标题/
+ * 列表/编号列表/引用 — verified 2026-09-05), so code fences become plain text
+ * blocks (newlines preserved inside one DraftJS block) styled as blockquotes
+ * for visual distinction. Method: open the 正文 block-type dropdown, click 引用.
+ */
+async function applyBlockquote(client: CdpClient): Promise<boolean> {
+  const btn = await client.eval<{ ok: boolean; x: number; y: number }>(`(() => {
+    const btns = [...document.querySelectorAll('button, [role="button"]')]
+      .filter(e => e.offsetParent !== null && (e.innerText || '').trim() === '正文');
+    if (!btns.length) return { ok: false, x: 0, y: 0 };
+    const r = btns[0].getBoundingClientRect();
+    return { ok: true, x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  })()`);
+  if (!btn?.ok) return false;
+  await client.clickAt(btn.x, btn.y);
+  await sleep(700);
+
+  const item = await client.eval<{ ok: boolean; x: number; y: number }>(`(() => {
+    const els = [...document.querySelectorAll('[role="menuitem"], [role="option"], button, [role="button"]')]
+      .filter(e => e.offsetParent !== null && (e.innerText || '').trim() === '引用');
+    if (!els.length) return { ok: false, x: 0, y: 0 };
+    const r = els[els.length - 1].getBoundingClientRect();
+    return { ok: true, x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  })()`);
+  if (!item?.ok) {
+    // close the dropdown again
+    await client.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+    await client.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+    return false;
+  }
+  await client.clickAt(item.x, item.y);
+  await sleep(500);
+  return true;
+}
+
+/**
+ * Phase 1.5: replace each code token with the code as plain text (newlines
+ * preserved inside one block — verified) styled as a blockquote. insertText
+ * over the selected token replaces it; the caret then sits inside that block,
+ * so the 正文→引用 dropdown applies the quote style to exactly that block.
  */
 async function insertCodeBlocks(
   client: CdpClient,
@@ -441,13 +475,11 @@ async function insertCodeBlocks(
   selectors: Selectors,
   profileMarker: string,
 ): Promise<void> {
-  console.log(`\n=== insertCodeBlocks (${codeBlocks.length}, paste-replace tokens) ===`);
-  const escHtml = (t: string) =>
-    t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  console.log(`\n=== insertCodeBlocks (${codeBlocks.length}, text + quote) ===`);
+  void profileMarker;
   let ok = 0;
   for (let i = 0; i < codeBlocks.length; i++) {
     const cb = codeBlocks[i] as Extract<Block, { kind: 'code' }>;
-    const html = `<pre><code>${escHtml(cb.text)}</code></pre>`;
     console.log(`- token[${i + 1}] ${cb.token} ← ${cb.lang || 'text'} (${cb.text.split('\n').length} lines)`);
 
     const pos = await client.eval<{ ok: boolean; reason?: string }>(
@@ -458,25 +490,37 @@ async function insertCodeBlocks(
       continue;
     }
 
-    await client.bringToFront();
-    await sleep(i === 0 ? 600 : 250);
-    // Atomic: activate → {DELETE} removes the highlighted token → load HTML
-    // clipboard → Ctrl+V. DraftJS replaces the selection with the pasted
-    // <pre>, i.e. a native code block at the exact token position.
-    await pasteHtml(html, cb.text, profileMarker, true);
-    await sleep(400);
+    // Replace the highlighted token with the code text (keeps \n in-block).
+    await client.insertText(cb.text);
+    await sleep(250);
 
-    // Verify the token is gone (the paste consumed it).
-    const gone = await client.eval<boolean>(
-      `(() => { const c = document.querySelector(${JSON.stringify(
-        selectors.composer,
-      )}); return !(c && (c.innerText || '').includes(${JSON.stringify(cb.token)})); })()`,
+    // Style the block as a blockquote while the caret is still in it.
+    const quoted = await applyBlockquote(client);
+
+    // Verify: token gone AND the block containing the first code line is no
+    // longer an unstyled paragraph.
+    const firstLine = cb.text.split('\n')[0]?.trim().slice(0, 30) ?? '';
+    const state = await client.eval<{ gone: boolean; cls: string }>(
+      `(() => {
+        const c = document.querySelector(${JSON.stringify(selectors.composer)});
+        const gone = !(c && (c.innerText || '').includes(${JSON.stringify(cb.token)}));
+        let cls = '';
+        if (c && ${JSON.stringify(firstLine)}) {
+          const b = [...c.querySelectorAll('[data-block="true"]')]
+            .find(x => (x.innerText || '').includes(${JSON.stringify(firstLine)}));
+          if (b) cls = b.className;
+        }
+        return { gone, cls };
+      })()`,
     );
-    if (gone) {
+    if (state?.gone && quoted && state.cls && !state.cls.includes('unstyled')) {
       ok++;
-      console.log(`  ✓ code block replaced token`);
+      console.log(`  ✓ code text inserted + quoted (${state.cls})`);
+    } else if (state?.gone) {
+      ok++;
+      console.log(`  ✓ code text inserted (quote ${quoted ? 'applied' : 'FAILED'}, cls=${state.cls || '?'})`);
     } else {
-      console.warn(`  ! token still present — paste may have failed`);
+      console.warn(`  ! token still present — insert may have failed`);
     }
   }
   console.log(`  code blocks inserted: ${ok}/${codeBlocks.length}`);
