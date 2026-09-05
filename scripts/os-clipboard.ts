@@ -220,6 +220,21 @@ export async function paste(profileMarker: WindowTarget = DEFAULT_PROFILE_MARKER
 }
 
 /**
+ * Activate the automation Chrome and send arbitrary SendKeys keystrokes
+ * (e.g. '{BS}' backspace, '^v', '{DELETE}'). The selection/caret must be placed
+ * via Selection API first — SendKeys goes to whatever the editor holds.
+ */
+export async function sendKeys(
+  keys: string,
+  profileMarker: WindowTarget = DEFAULT_PROFILE_MARKER,
+): Promise<void> {
+  if (process.platform === 'win32') {
+    return activateAndSendKeysWindows(profileMarker, keys);
+  }
+  throw new Error(`sendKeys not yet implemented for platform ${process.platform}`);
+}
+
+/**
  * Activate the automation Chrome and press DELETE `times` times. Used to remove
  * a selected image — the selection must be created first via Selection API
  * (range.selectNode) in the page. CDP Backspace / execCommand('delete') do not

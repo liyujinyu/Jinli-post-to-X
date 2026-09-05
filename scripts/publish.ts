@@ -25,7 +25,7 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 import { connect, CdpClient, sleep } from './cdp.ts';
-import { copyImage, paste, deleteSelection, pasteImage } from './os-clipboard.ts';
+import { copyImage, paste, deleteSelection, pasteImage, sendKeys } from './os-clipboard.ts';
 import { parseArticle, type Block } from './markdown.ts';
 
 /** Resolve a path relative to this script file (works on Bun and Node). */
@@ -724,31 +724,24 @@ async function applyBlockStyles(
 }
 
 /**
- * Apply the 引用 (blockquote) style to the block the caret is currently in.
- * X Articles has NO native code-block support (block menu: 正文/大标题/小标题/
- * 列表/编号列表/引用 — verified 2026-09-05), so code fences become plain text
- * blocks (newlines preserved inside one DraftJS block) styled as blockquotes
- * for visual distinction. Method: open the 正文 block-type dropdown, click 引用.
- */
-async function applyBlockquote(client: CdpClient): Promise<boolean> {
-  // The editor toolbar exposes a direct quote toggle button. Use a native JS
-  // .click() — CDP coordinate clicks proved unreliable here (the same offset
-  // that missed the Write button picked the wrong menu item).
-  const clicked = await client.eval<boolean>(`(() => {
-    const b = document.querySelector('[data-testid="btn-blockquote"]');
-    if (!b || b.offsetParent === null) return false;
-    b.click();
-    return true;
-  })()`);
-  await sleep(450);
-  return clicked;
-}
-
-/**
- * Phase 1.5: replace each code token with the code as plain text (newlines
- * preserved inside one block — verified) styled as a blockquote. insertText
- * over the selected token replaces it; the caret then sits inside that block,
- * so the 正文→引用 dropdown applies the quote style to exactly that block.
+ * Phase 1.5: replace each code token with a REAL X code card.
+ *
+ * X Articles DOES have native code blocks (verified 2026-09-05, correcting the
+ * earlier finding): the toolbar has a separate 「插入」 dropdown (next to the
+ * 正文 dropdown) with menu items 媒体/GIF/帖子/分割线/代码/LaTeX/表格. 代码 opens
+ * a dialog with input[data-testid="programming-language-input"], a code
+ * <textarea>, and an 插入 button — the resulting card renders with syntax
+ * highlighting and a language label.
+ *
+ * Verified per-block flow (ran 18/18 successfully on draft 2096095610722283520):
+ *   1. COLLAPSED caret inside the token block — a held selection makes the
+ *      插入 menu fail to open (verified failure mode).
+ *   2. Click 插入 → menuitem 代码 → dialog appears.
+ *   3. Fill the dialog textarea (stash text in window.__ct to avoid escaping)
+ *      + language input → click dialog 插入. The card lands AFTER the token block.
+ *   4. Remove the leftover token block: selectNodeContents + OS DELETE clears
+ *      the text, then caret + OS Backspace unstyles the empty block away.
+ *      (selectNode + DELETE on a whole text block does NOT work — verified.)
  */
 async function insertCodeBlocks(
   client: CdpClient,
@@ -756,8 +749,7 @@ async function insertCodeBlocks(
   selectors: Selectors,
   profileMarker: string,
 ): Promise<void> {
-  console.log(`\n=== insertCodeBlocks (${codeBlocks.length}, text + quote) ===`);
-  void profileMarker;
+  console.log(`\n=== insertCodeBlocks (${codeBlocks.length}, native code cards via 插入→代码) ===`);
   let ok = 0;
   for (let i = 0; i < codeBlocks.length; i++) {
     const cb = codeBlocks[i] as Extract<Block, { kind: 'code' }>;
@@ -765,62 +757,153 @@ async function insertCodeBlocks(
 
     let done = false;
     for (let attempt = 0; attempt < 2 && !done; attempt++) {
-      const pos = await selectTokenVerified(client, cb.token, selectors);
-      if (!pos) {
-        console.warn(`  ! token could not be verifiably selected (attempt ${attempt + 1})`);
+      // Step 1: collapsed caret inside the token block; stash the code text.
+      const prep = await client.eval<string>(
+        `(() => { try {
+          const c = document.querySelector(${JSON.stringify(selectors.composer)});
+          if (!c) return 'NOCOMPOSER';
+          const b = [...c.querySelectorAll('[data-block="true"]')]
+            .find(x => (x.innerText || '').includes(${JSON.stringify(cb.token)}));
+          if (!b) return 'NOBLOCK';
+          b.scrollIntoView({ block: 'center' });
+          window.__jptxCode = ${JSON.stringify(cb.text)};
+          window.__jptxLang = ${JSON.stringify(cb.lang || '')};
+          const walker = document.createTreeWalker(b, NodeFilter.SHOW_TEXT);
+          const tn = walker.nextNode();
+          const rg = document.createRange();
+          if (tn) { rg.setStart(tn, 0); rg.collapse(true); }
+          else { rg.selectNodeContents(b); rg.collapse(true); }
+          const s = window.getSelection();
+          s.removeAllRanges(); s.addRange(rg);
+          b.closest('[contenteditable="true"]')?.focus();
+          return 'OK';
+        } catch (e) { return 'ERR:' + e.message; } })()`,
+      );
+      if (prep !== 'OK') {
+        console.warn(`  ! caret prep failed (${prep}, attempt ${attempt + 1})`);
+        continue;
+      }
+      await sleep(450);
+
+      // Step 2: 插入 → 代码.
+      await client.eval(`(() => { const b=[...document.querySelectorAll('button')]
+        .find(x => (x.innerText || '').trim() === '插入'); if (b) b.click(); })()`);
+      await sleep(800);
+      const menu = await client.eval<string>(`(() => {
+        const items = [...document.querySelectorAll('[role="menuitem"], [role="option"]')];
+        const m = items.find(x => (x.innerText || '').trim() === '代码');
+        if (!m) return 'NOMENU';
+        m.click(); return 'OK'; })()`);
+      if (menu !== 'OK') {
+        console.warn(`  ! insert menu failed (${menu}, attempt ${attempt + 1})`);
+        await client.eval(`document.body.click()`).catch(() => {});
         continue;
       }
 
-      // Replace the highlighted token with the code text (keeps \n in-block).
-      await client.insertText(cb.text);
-      await sleep(350);
-
-      // Style the block as a blockquote while the caret is still in it.
-      const quoted = await applyBlockquote(client);
-
-      // Verify: token gone AND the block containing the first code line is a
-      // blockquote. Verify LATE — the class check right after the click races
-      // DraftJS re-renders (a verified false negative in an earlier run).
-      const firstLine = cb.text.split('\n')[0]?.trim().slice(0, 30) ?? '';
+      // Step 3: wait for the dialog and fill it.
+      let dlg = 'WAIT';
+      for (let w = 0; w < 10 && dlg !== 'READY'; w++) {
+        await sleep(300);
+        dlg = await client.eval<string>(
+          `document.querySelector('[role="dialog"] textarea') ? 'READY' : 'WAIT'`,
+        );
+      }
+      if (dlg !== 'READY') {
+        console.warn(`  ! code dialog never appeared (attempt ${attempt + 1})`);
+        continue;
+      }
+      await client.eval(`(() => {
+        const m = document.querySelector('[role="dialog"]');
+        const ta = m.querySelector('textarea');
+        const setTa = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+        setTa.call(ta, window.__jptxCode || '');
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+        const li = m.querySelector('input[data-testid="programming-language-input"]');
+        if (li && window.__jptxLang) {
+          const setLi = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+          setLi.call(li, window.__jptxLang);
+          li.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        return 1; })()`);
       await sleep(500);
-      const state = await client.eval<{ gone: boolean; cls: string }>(
+      const inserted = await client.eval<string>(`(() => {
+        const m = document.querySelector('[role="dialog"]');
+        if (!m) return 'NODLG';
+        const b = [...m.querySelectorAll('button')].find(x => (x.innerText || '').trim() === '插入');
+        if (!b) return 'NOBTN';
+        b.click(); return 'OK'; })()`);
+      if (inserted !== 'OK') {
+        console.warn(`  ! dialog insert failed (${inserted}, attempt ${attempt + 1})`);
+        await client.eval(`(() => { const m=document.querySelector('[role="dialog"]');
+          if (m) { const x=m.querySelector('[data-testid="app-bar-close"]'); if (x) x.click(); } return 1; })()`);
+        continue;
+      }
+      await sleep(1500);
+
+      // Step 4: clear the leftover token block (text via OS DELETE).
+      const held = await client.eval<string>(
+        `(() => { try {
+          const c = document.querySelector(${JSON.stringify(selectors.composer)});
+          const b = [...c.querySelectorAll('[data-block="true"]')]
+            .find(x => (x.innerText || '').includes(${JSON.stringify(cb.token)}));
+          if (!b) return 'GONE';
+          const rg = document.createRange(); rg.selectNodeContents(b);
+          const s = window.getSelection(); s.removeAllRanges(); s.addRange(rg);
+          b.closest('[contenteditable="true"]')?.focus();
+          return s.toString().length > 0 ? 'HELD' : 'EMPTY';
+        } catch (e) { return 'ERR:' + e.message; } })()`,
+      );
+      if (held === 'HELD') {
+        await sleep(400);
+        await client.bringToFront();
+        await sleep(250);
+        await deleteSelection(1, profileMarker);
+        await sleep(1200);
+      }
+      // Backspace the now-empty block so no stray blank line keeps block styles.
+      const caret = await client.eval<string>(
+        `(() => { const c = document.querySelector(${JSON.stringify(selectors.composer)});
+          const b = [...c.querySelectorAll('[data-block="true"]')]
+            .find(x => (x.innerText || '').includes(${JSON.stringify(cb.token)}));
+          if (!b) return 'GONE';
+          const rg = document.createRange(); rg.selectNodeContents(b); rg.collapse(true);
+          const s = window.getSelection(); s.removeAllRanges(); s.addRange(rg);
+          b.closest('[contenteditable="true"]')?.focus();
+          return 'CARET'; })()`,
+      );
+      if (caret === 'CARET') {
+        await sleep(400);
+        await client.bringToFront();
+        await sleep(250);
+        await sendKeys('{BS}', profileMarker);
+        await sleep(1300);
+      }
+
+      // Verify: token gone from composer AND a code card (编辑块 button)
+      // containing the first code line exists.
+      const firstLine = cb.text.split('\n')[0]?.trim().slice(0, 25) ?? '';
+      const state = await client.eval<{ gone: boolean; card: boolean }>(
         `(() => {
           const c = document.querySelector(${JSON.stringify(selectors.composer)});
+          const blocks = c ? [...c.querySelectorAll('[data-block="true"]')] : [];
           const gone = !(c && (c.innerText || '').includes(${JSON.stringify(cb.token)}));
-          let cls = '';
-          if (c && ${JSON.stringify(firstLine)}) {
-            const b = [...c.querySelectorAll('[data-block="true"]')]
-              .find(x => (x.innerText || '').includes(${JSON.stringify(firstLine)}));
-            if (b) cls = b.className;
-          }
-          return { gone, cls };
+          const card = blocks.some(b =>
+            b.querySelector('button[aria-label="编辑块"]') &&
+            ${JSON.stringify(firstLine ? true : false)} &&
+            (b.innerText || '').includes(${JSON.stringify(firstLine)}));
+          return { gone, card };
         })()`,
       );
-      if (state?.gone && quoted && state.cls && state.cls.includes('quote')) {
+      if (state?.gone && state.card) {
         done = true;
-        console.log(`  ✓ code text inserted + quoted (${state.cls})`);
-      } else if (state?.gone) {
-        // Text landed but quote not confirmed — re-apply quote once.
-        const requoted = await applyBlockquote(client);
-        await sleep(500);
-        const cls2 = await client.eval<string>(
-          `(() => { const c = document.querySelector(${JSON.stringify(selectors.composer)});
-             const b = c && [...c.querySelectorAll('[data-block="true"]')].find(x => (x.innerText || '').includes(${JSON.stringify(firstLine)}));
-             return b ? b.className : ''; })()`,
-        );
-        if (cls2 && cls2.includes('quote')) {
-          done = true;
-          console.log(`  ✓ code text inserted + quoted on re-apply (${cls2}, click=${requoted})`);
-        } else if (attempt === 1) {
-          console.warn(`  ! quote NOT confirmed (cls=${cls2 || '?'})`);
-        }
+        console.log(`  ✓ native code card inserted`);
       } else if (attempt === 1) {
-        console.warn(`  ! token still present — insert failed`);
+        console.warn(`  ! verify failed (gone=${state?.gone}, card=${state?.card})`);
       }
     }
     if (done) ok++;
   }
-  console.log(`  code blocks inserted: ${ok}/${codeBlocks.length}`);
+  console.log(`  code cards inserted: ${ok}/${codeBlocks.length}`);
   await snapshot(client, selectors, 'insertCodeBlocks:after');
 }
 
