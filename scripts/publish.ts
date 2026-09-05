@@ -434,31 +434,32 @@ async function fillBody(
  * for visual distinction. Method: open the 正文 block-type dropdown, click 引用.
  */
 async function applyBlockquote(client: CdpClient): Promise<boolean> {
-  const btn = await client.eval<{ ok: boolean; x: number; y: number }>(`(() => {
+  // NOTE: use native JS .click() — CDP coordinate clicks proved unreliable here
+  // (the same click that missed the Write button picked 大标题 instead of 引用).
+  const opened = await client.eval<boolean>(`(() => {
     const btns = [...document.querySelectorAll('button, [role="button"]')]
       .filter(e => e.offsetParent !== null && (e.innerText || '').trim() === '正文');
-    if (!btns.length) return { ok: false, x: 0, y: 0 };
-    const r = btns[0].getBoundingClientRect();
-    return { ok: true, x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    if (!btns.length) return false;
+    btns[0].click();
+    return true;
   })()`);
-  if (!btn?.ok) return false;
-  await client.clickAt(btn.x, btn.y);
+  if (!opened) return false;
   await sleep(700);
 
-  const item = await client.eval<{ ok: boolean; x: number; y: number }>(`(() => {
-    const els = [...document.querySelectorAll('[role="menuitem"], [role="option"], button, [role="button"]')]
+  const applied = await client.eval<boolean>(`(() => {
+    const els = [...document.querySelectorAll('[role="menuitem"], [role="option"], button, [role="button"], div[tabindex]')]
       .filter(e => e.offsetParent !== null && (e.innerText || '').trim() === '引用');
-    if (!els.length) return { ok: false, x: 0, y: 0 };
-    const r = els[els.length - 1].getBoundingClientRect();
-    return { ok: true, x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    if (!els.length) return false;
+    els[els.length - 1].click();
+    return true;
   })()`);
-  if (!item?.ok) {
+  if (!applied) {
     // close the dropdown again
     await client.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
     await client.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+    await sleep(300);
     return false;
   }
-  await client.clickAt(item.x, item.y);
   await sleep(500);
   return true;
 }
@@ -513,12 +514,11 @@ async function insertCodeBlocks(
         return { gone, cls };
       })()`,
     );
-    if (state?.gone && quoted && state.cls && !state.cls.includes('unstyled')) {
+    if (state?.gone && quoted && state.cls && state.cls.includes('quote')) {
       ok++;
       console.log(`  ✓ code text inserted + quoted (${state.cls})`);
     } else if (state?.gone) {
-      ok++;
-      console.log(`  ✓ code text inserted (quote ${quoted ? 'applied' : 'FAILED'}, cls=${state.cls || '?'})`);
+      console.warn(`  ! code text inserted but quote NOT confirmed (quoted=${quoted}, cls=${state.cls || '?'})`);
     } else {
       console.warn(`  ! token still present — insert may have failed`);
     }
