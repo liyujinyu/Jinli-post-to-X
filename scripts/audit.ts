@@ -12,9 +12,11 @@
  *
  * 校验项(全部来自 2026-09-05 在真实草稿上验证过的 DOM 事实):
  *   - 残留占位 token(composer 内不得出现 XAP-)
+ *   - 空行残留:正文中间的空块(如代码卡片上方未删净的 token 空壳);结尾留白放行
+ *   - 乱码:U+FFFD 替换符 / 控制字符 / UTF-8→Latin1 双重编码特征
  *   - 标题已填且与 frontmatter 一致
  *   - 块类型计数:H1/H2/UL/OL/CODE 卡片/图片/段落
- *   - 块顺序:期望 kind 序列 vs 实际序列逐项比对(空行/伪块忽略),含文本抽查
+ *   - 块顺序:期望 kind 序列 vs 实际序列逐项比对(空块不计入序列),含文本抽查
  *   - 链接:每个 markdown 链接 URL 都有对应 <a href>
  */
 
@@ -46,14 +48,16 @@ function expectedKind(b: Block): string {
   }
 }
 
-/** 页内执行:把 composer 的每个块映射为 kind + 文本(空行/伪块返回 null 忽略)。 */
+/** 页内执行:把 composer 的每个块映射为 kind + 文本;空块不再静默忽略,记入 empties。 */
 function dumpExpr(composer: string): string {
   return `(() => { try {
     const NL = String.fromCharCode(10);
     const c = document.querySelector(${JSON.stringify(composer)});
     if (!c) return JSON.stringify({ error: 'NO_COMPOSER' });
-    const out = [];
-    for (const b of c.querySelectorAll('[data-block="true"]')) {
+    const all = [...c.querySelectorAll('[data-block="true"]')];
+    const out = []; const empties = [];
+    let lastContent = -1;
+    all.forEach((b, i) => {
       let kind = null;
       if (b.querySelector('img')) kind = 'IMG';
       else if (b.querySelector('button[aria-label="编辑块"]')) kind = 'CODE';
@@ -65,10 +69,22 @@ function dumpExpr(composer: string): string {
         else if (cls.includes('ordered-list-item')) kind = 'OL';
         else if ((b.innerText || '').trim()) kind = 'P';
       }
-      if (kind) out.push({ kind, text: (b.innerText || '').trim().split(NL).join(' ') });
-    }
+      if (kind) {
+        out.push({ kind, text: (b.innerText || '').trim().split(NL).join(' ') });
+        lastContent = i;
+      } else {
+        empties.push({
+          idx: i,
+          prev: out.length
+            ? out[out.length - 1].kind + ' “' + out[out.length - 1].text.slice(0, 18) + '”'
+            : '(文首)',
+        });
+      }
+    });
+    // 结尾连续空块 = 收尾留白(编辑器常态),不算残留
+    for (const e of empties) e.trailing = e.idx > lastContent;
     const anchors = [...c.querySelectorAll('a[href]')].map(a => a.getAttribute('href'));
-    return JSON.stringify({ blocks: out, anchors, error: null });
+    return JSON.stringify({ blocks: out, anchors, empties, error: null });
   } catch (e) { return JSON.stringify({ error: 'ERR:' + e.message }); } })()`;
 }
 
@@ -91,7 +107,11 @@ export async function auditDraft(
   };
 
   const raw = await client.eval<any>(dumpExpr(composer));
-  let dom: { blocks: DomBlock[]; anchors: string[] };
+  let dom: {
+    blocks: DomBlock[];
+    anchors: string[];
+    empties: { idx: number; prev: string; trailing: boolean }[];
+  };
   try {
     const parsed = JSON.parse(raw);
     if (parsed.error) throw new Error(parsed.error);
@@ -109,6 +129,19 @@ export async function auditDraft(
     leftover.length ? `${leftover.length} 处残留: ${leftover.map(b => b.text.slice(0, 30)).join(' / ')}` : 'composer 内无 XAP-',
   );
 
+  // 1b. 空行残留:正文中间的空块(如代码卡片上方没删干净的 token 空壳);
+  //     结尾留白(trailing)是编辑器常态,放行但计数提示。
+  const stray = (dom.empties || []).filter(e => !e.trailing);
+  add(
+    '无空行残留',
+    stray.length === 0,
+    stray.length
+      ? `${stray.length} 处: ${stray.map(e => `第 ${e.idx + 1} 块,上方是 ${e.prev}`).join('; ').slice(0, 200)}`
+      : (dom.empties || []).length
+        ? `正文无空行(结尾留白 ${(dom.empties || []).length} 块,已忽略)`
+        : '正文无空行',
+  );
+
   // 2. 标题
   const titleVal = await client.eval<string>(
     `(() => { const t = document.querySelector(${JSON.stringify(titleSelector)});
@@ -116,6 +149,24 @@ export async function auditDraft(
   );
   add('标题', !!titleVal && titleVal.trim() === article.title.trim(),
     titleVal ? `已填: ${titleVal.slice(0, 30)}` : '标题为空');
+
+  // 2b. 乱码:三类特征——U+FFFD 替换符(编码丢失)、C0/C1 控制字符、
+  //     UTF-8→Latin1 双重编码(中文乱码整串落在 U+00A0–U+00FF 区间;合法文本几乎不会有
+  //     ≥3 个连续字符落在该区间,法/德语重音词不受影响)。
+  const MOJIBAKE = /\uFFFD|[\x00-\x08\x0B\x0E-\x1F\x7F-\x9F]|[\u00A0-\u00FF]{3,}/;
+  const texts = [titleVal || '', ...dom.blocks.map(b => b.text)];
+  const garbled = texts.filter(t => t && MOJIBAKE.test(t));
+  const garbledCtx = garbled.slice(0, 5).map(t => {
+    const i = t.search(MOJIBAKE);
+    return JSON.stringify(t.slice(Math.max(0, i - 4), i + 8));
+  });
+  add(
+    '无乱码',
+    garbled.length === 0,
+    garbled.length
+      ? `${garbled.length} 处可疑: ${garbledCtx.join(' ')}(若为法/德/北欧语源词汇可能误报,需人工确认)`
+      : '标题与全部块文本未发现替换符/控制符/双重编码特征',
+  );
 
   // 3. 计数
   const expected = article.blocks.map(expectedKind);
