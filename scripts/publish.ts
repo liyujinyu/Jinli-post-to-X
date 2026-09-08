@@ -880,6 +880,38 @@ async function insertCodeBlocks(
         await sleep(1300);
       }
 
+      // Step 4.5: a single Backspace may only unstyle the emptied token block
+      // without removing it — leaving a stray blank line ABOVE the code card
+      // (observed on every card in the 2026-09-08 draft). Detect an empty text
+      // block directly above THIS card and backspace it away, up to 3 rounds.
+      const firstLineNow = cb.text.split('\n')[0]?.trim().slice(0, 25) ?? '';
+      for (let r = 0; r < 3; r++) {
+        const emptyAbove = await client.eval<string>(
+          `(() => { try {
+            const c = document.querySelector(${JSON.stringify(selectors.composer)});
+            const blocks = c ? [...c.querySelectorAll('[data-block="true"]')] : [];
+            const idx = blocks.findIndex(b =>
+              b.querySelector('button[aria-label="编辑块"]') &&
+              ${JSON.stringify(firstLineNow ? true : false)} &&
+              (b.innerText || '').includes(${JSON.stringify(firstLineNow)}));
+            if (idx <= 0) return 'NO';
+            const prev = blocks[idx - 1];
+            if ((prev.innerText || '').trim() !== '') return 'NO';
+            const rg = document.createRange(); rg.selectNodeContents(prev); rg.collapse(true);
+            const s = window.getSelection(); s.removeAllRanges(); s.addRange(rg);
+            prev.closest('[contenteditable="true"]')?.focus();
+            return 'EMPTY';
+          } catch (e) { return 'ERR:' + e.message; } })()`,
+        );
+        if (emptyAbove !== 'EMPTY') break;
+        console.log(`  · stray blank line above code card ${i + 1}, removing (round ${r + 1})`);
+        await sleep(400);
+        await client.bringToFront();
+        await sleep(250);
+        await sendKeys('{BS}', profileMarker);
+        await sleep(900);
+      }
+
       // Verify: token gone from composer AND a code card (编辑块 button)
       // containing the first code line exists.
       const firstLine = cb.text.split('\n')[0]?.trim().slice(0, 25) ?? '';
