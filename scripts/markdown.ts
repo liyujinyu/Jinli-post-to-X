@@ -53,7 +53,9 @@ export type InlineRun = {
 export type Block =
   | { kind: 'paragraph'; text: string; runs: InlineRun[] }
   | { kind: 'heading'; level: number; text: string; token: string }
+  | { kind: 'quote'; text: string; runs: InlineRun[]; token: string }
   | { kind: 'listitem'; ordered: boolean; text: string; token: string }
+  | { kind: 'table'; rows: string[][]; raw: string[]; token: string }
   | { kind: 'image'; path: string; raw: string; token: string }
   | { kind: 'code'; lang: string; text: string; token: string };
 
@@ -82,6 +84,16 @@ export function headingToken(i: number): string {
 /** Token for list item #`i` (1-based). */
 export function listToken(i: number): string {
   return `XAP-L-${i}-PLACEHOLDER`;
+}
+
+/** Token for quote block #`i` (1-based) — styled with the toolbar quote button. */
+export function quoteToken(i: number): string {
+  return `XAP-Q-${i}-PLACEHOLDER`;
+}
+
+/** Token for table #`i` (1-based) — replaced by a rendered screenshot image. */
+export function tableToken(i: number): string {
+  return `XAP-TBL-${i}-PLACEHOLDER`;
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +250,48 @@ export function parseArticle(mdPath: string): ParsedArticle {
   let imageCount = 0;
   let headingCount = 0;
   let listCount = 0;
+  let quoteCount = 0;
+  let tableCount = 0;
+
+  // Quote buffering: consecutive "> " lines merge into ONE quote block
+  // (matching how Obsidian renders a multi-line quote).
+  let quoteBuf: string[] = [];
+  const flushQuote = () => {
+    if (quoteBuf.length) {
+      quoteCount++;
+      const text = quoteBuf.join(' ').trim();
+      const runs = parseRuns(text);
+      blocks.push({ kind: 'quote', text, runs, token: quoteToken(quoteCount) });
+      quoteBuf = [];
+    }
+  };
+
+  // Table buffering: consecutive "|...|" lines form one table. The separator
+  // row (|---|---|) is dropped at flush time.
+  let tableBuf: string[] = [];
+  const flushTable = () => {
+    if (!tableBuf.length) return;
+    const rows: string[][] = [];
+    for (const line of tableBuf) {
+      const cells = line
+        .split('|')
+        .map((c) => c.trim())
+        .filter((c, i, arr) => !(c === '' && (i === 0 || i === arr.length - 1)));
+      const isSep =
+        cells.length > 0 && cells.every((c) => /^:?-+:?$/.test(c.replace(/\s/g, '')));
+      if (!isSep) rows.push(cells);
+    }
+    if (rows.length) {
+      tableCount++;
+      blocks.push({
+        kind: 'table',
+        rows,
+        raw: tableBuf.slice(),
+        token: tableToken(tableCount),
+      });
+    }
+    tableBuf = [];
+  };
 
   const flushParagraph = () => {
     const raw = pendingParagraph.trim();
@@ -246,6 +300,13 @@ export function parseArticle(mdPath: string): ParsedArticle {
       blocks.push({ kind: 'paragraph', text: runs.map((r) => r.text).join(''), runs });
     }
     pendingParagraph = '';
+  };
+
+  /** Flush quote/table/paragraph buffers in document order. */
+  const flushInline = () => {
+    flushQuote();
+    flushTable();
+    flushParagraph();
   };
 
   // Fenced code blocks: lines between ``` fences become ONE code block with
@@ -263,7 +324,7 @@ export function parseArticle(mdPath: string): ParsedArticle {
     const fence = line.trim().match(/^```\s*(\S*)\s*$/);
     if (fence) {
       if (!inCode) {
-        flushParagraph();
+        flushInline();
         inCode = true;
         codeLang = fence[1] ?? '';
         codeLines = [];
@@ -291,10 +352,10 @@ export function parseArticle(mdPath: string): ParsedArticle {
     if (head) {
       if (!sawFirstH1) {
         sawFirstH1 = true;
-        flushParagraph();
+        flushInline();
         continue;
       }
-      flushParagraph();
+      flushInline();
       headingCount++;
       blocks.push({
         kind: 'heading',
@@ -305,11 +366,29 @@ export function parseArticle(mdPath: string): ParsedArticle {
       continue;
     }
 
+    // Blockquote: "> text" lines. Consecutive lines merge into one quote
+    // block (styled later with the toolbar quote button, like headings/lists).
+    const qt = line.match(/^\s*>\s?(.*)$/);
+    if (qt) {
+      flushTable();
+      flushParagraph();
+      quoteBuf.push(qt[1] ?? '');
+      continue;
+    }
+
+    // Table rows: lines starting with "|". Buffered until a non-table line.
+    if (/^\s*\|/.test(line)) {
+      flushQuote();
+      flushParagraph();
+      tableBuf.push(line.trim());
+      continue;
+    }
+
     // List items: each "- x" / "* x" / "1. x" line is its own block, later
     // styled with btn-ul (unordered) or btn-ol (ordered).
     const li = line.match(/^\s*(?:([-*])|(\d+\.))\s+(.*)$/);
     if (li) {
-      flushParagraph();
+      flushInline();
       listCount++;
       blocks.push({
         kind: 'listitem',
@@ -322,7 +401,7 @@ export function parseArticle(mdPath: string): ParsedArticle {
 
     const img = matchImageToken(line);
     if (img) {
-      flushParagraph();
+      flushInline();
       imageCount++;
       const resolved = resolveImagePath(img.ref, mdDir);
       blocks.push({
@@ -335,14 +414,16 @@ export function parseArticle(mdPath: string): ParsedArticle {
     }
 
     if (line.trim() === '') {
-      flushParagraph();
+      flushInline();
       continue;
     }
 
-    // Accumulate the text line (join soft-wrapped lines with a space).
+    // Accumulate the text line (join soft-wrapped lines with a space). A text
+    // line directly after a quote/table line ends that quote/table.
+    if (quoteBuf.length || tableBuf.length) flushInline();
     pendingParagraph += (pendingParagraph ? ' ' : '') + line.trim();
   }
-  flushParagraph();
+  flushInline();
   // Unterminated fence (missing closing ```): keep the code, don't drop it.
   if (inCode && codeLines.length) {
     codeCount++;

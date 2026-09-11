@@ -32,16 +32,21 @@ export type AuditReport = {
 
 type DomBlock = { kind: string; text: string };
 
-/** markdown block → expected DOM kind(## → H1 标题,≥### → H2 副标题)。 */
+/** markdown block → expected DOM kind(## → H1 标题,≥### → H2 副标题,> → QUOTE)。 */
 function expectedKind(b: Block): string {
   switch (b.kind) {
     case 'heading':
       return b.level <= 2 ? 'H1' : 'H2';
     case 'listitem':
       return b.ordered ? 'OL' : 'UL';
+    case 'quote':
+      return 'QUOTE';
     case 'code':
       return 'CODE';
     case 'image':
+      return 'IMG';
+    case 'table':
+      // publish 把表格渲染成 PNG 后按图片插入;独立复检时同样按 IMG 期望。
       return 'IMG';
     default:
       return 'P';
@@ -67,6 +72,7 @@ function dumpExpr(composer: string): string {
         else if (cls.includes('header-two')) kind = 'H2';
         else if (cls.includes('unordered-list-item')) kind = 'UL';
         else if (cls.includes('ordered-list-item')) kind = 'OL';
+        else if (/quote/i.test(cls)) kind = 'QUOTE';
         else if ((b.innerText || '').trim()) kind = 'P';
       }
       if (kind) {
@@ -172,7 +178,7 @@ export async function auditDraft(
   const expected = article.blocks.map(expectedKind);
   const count = (arr: string[], k: string) => arr.filter(x => x === k).length;
   const actual = dom.blocks.map(b => b.kind);
-  for (const k of ['H1', 'H2', 'UL', 'OL', 'CODE', 'IMG', 'P']) {
+  for (const k of ['H1', 'H2', 'UL', 'OL', 'QUOTE', 'CODE', 'IMG', 'P']) {
     const e = count(expected, k), a = count(actual, k);
     add(`数量 ${k}`, e === a, `期望 ${e} / 实际 ${a}`);
   }
@@ -185,7 +191,7 @@ export async function auditDraft(
         mismatches++;
         if (mismatches <= 5) {
           add(`顺序 #${i + 1}`, false,
-            `期望 ${expected[i]}("${article.blocks[i].kind === 'image' ? (article.blocks[i] as any).path.split(/[\\/]/).pop() : ('text' in article.blocks[i] ? String(article.blocks[i].text).slice(0, 15) : '')}") 实际 ${actual[i]}("${dom.blocks[i].text.slice(0, 15)}")`);
+            `期望 ${expected[i]}("${article.blocks[i].kind === 'image' ? (article.blocks[i] as any).path.split(/[\\/]/).pop() : String((article.blocks[i] as any).text ?? '').slice(0, 15)}") 实际 ${actual[i]}("${dom.blocks[i].text.slice(0, 15)}")`);
         }
       }
     }
@@ -196,7 +202,7 @@ export async function auditDraft(
     let textBad = 0;
     for (let i = 0; i < article.blocks.length; i++) {
       const b = article.blocks[i];
-      if (b.kind === 'image' || b.kind === 'code') continue;
+      if (b.kind === 'image' || b.kind === 'code' || b.kind === 'table') continue;
       const want = normalize(b.text);
       if (want && normalize(dom.blocks[i].text) !== want) {
         textBad++;

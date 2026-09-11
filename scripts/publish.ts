@@ -22,11 +22,11 @@ import { writeFile, mkdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { connect, CdpClient, sleep } from './cdp.ts';
+import { connect, CdpClient, CdpBrowser, sleep } from './cdp.ts';
 import { copyImage, paste, deleteSelection, pasteImage, sendKeys } from './os-clipboard.ts';
-import { parseArticle, type Block } from './markdown.ts';
+import { parseArticle, parseRuns, imageToken, type Block, type InlineRun } from './markdown.ts';
 import { auditDraft, printReport } from './audit.ts';
 
 /** Resolve a path relative to this script file (works on Bun and Node). */
@@ -99,6 +99,8 @@ const DEFAULT_SELECTORS = {
   applyButton: '[data-testid="applyButton"]',
   publishText: ['发布', 'Publish', '公開', '게시'],
   composerImages: '[data-testid="composer"] img',
+  // 工具栏引号（blockquote）按钮候选；aria-label 回退在 clickQuoteButton 里。
+  quoteButton: ['[data-testid="btn-block-quote"]', '[data-testid="btn-quote"]'],
 };
 
 type Selectors = typeof DEFAULT_SELECTORS;
@@ -335,6 +337,64 @@ async function snapshot(client: CdpClient, selectors: Selectors, label: string):
 }
 
 // ---------------------------------------------------------------------------
+// Selection hygiene (the bold-deletion bug fix)
+// ---------------------------------------------------------------------------
+
+/**
+ * Collapse the DOM selection to its end. CRITICAL after any toolbar action:
+ * a held selection makes the next CDP Input.insertText / Enter keypress
+ * DELETE the selected text (browser input replaces the active selection).
+ * This is what made bold runs vanish mid-article.
+ */
+async function collapseSelection(client: CdpClient): Promise<void> {
+  await client.eval(
+    `(() => { const s = window.getSelection();
+       if (s && s.rangeCount && !s.isCollapsed) {
+         const r = s.getRangeAt(0); r.collapse(false);
+         s.removeAllRanges(); s.addRange(r);
+       } return true; })()`,
+  ).catch(() => {});
+}
+
+/** Toolbar bold/italic click with aria-label fallback (testid may change). */
+async function clickToolbarInline(
+  client: CdpClient,
+  r: { bold?: boolean; italic?: boolean },
+): Promise<void> {
+  const tid = r.bold ? 'btn-bold' : 'btn-italic';
+  let ok = await client.eval<boolean>(
+    `(() => { const b = document.querySelector('[data-testid="${tid}"]');
+       if (b && b.offsetParent !== null) { b.click(); return true } return false })()`,
+  );
+  if (!ok) {
+    const labelRe = r.bold ? '加粗|粗体|bold|太字' : '斜体|italic|斜体';
+    ok = await client.eval<boolean>(
+      `(() => { const re = new RegExp(${JSON.stringify(labelRe)}, 'i');
+         const b = [...document.querySelectorAll('button[aria-label]')]
+           .find(x => re.test(x.getAttribute('aria-label') || '') && x.offsetParent !== null);
+         if (b) { b.click(); return true } return false })()`,
+    );
+  }
+}
+
+/** Toolbar quote (blockquote) button: selector list, then aria-label fallback. */
+async function clickQuoteButton(client: CdpClient, selectors: Selectors): Promise<boolean> {
+  for (const sel of selectors.quoteButton) {
+    const ok = await client.eval<boolean>(
+      `(() => { const b = document.querySelector(${JSON.stringify(sel)});
+         if (b && b.offsetParent !== null) { b.click(); return true } return false })()`,
+    );
+    if (ok) return true;
+  }
+  return client.eval<boolean>(
+    `(() => { const re = /引用|引用文|blockquote|quote/i;
+       const b = [...document.querySelectorAll('button[aria-label]')]
+         .find(x => re.test(x.getAttribute('aria-label') || '') && x.offsetParent !== null);
+       if (b) { b.click(); return true } return false })()`,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Steps
 // ---------------------------------------------------------------------------
 
@@ -470,6 +530,10 @@ async function fillBody(
     await client.insertText(content);
     await sleep(120);
     if (b.kind === 'paragraph') await applyInlineRuns(client, b, selectors);
+    // NEVER press Enter / type the next block while a selection is held —
+    // the browser would delete the selected (just-bolded) text.
+    await collapseSelection(client);
+    await sleep(150);
     if (i < blocks.length - 1) await client.pressKey(13, 'Enter', 'Enter');
     await sleep(80);
   }
@@ -527,14 +591,17 @@ function selectRunExpr(
 }
 
 /**
- * Style the link / bold / italic runs of a JUST-TYPED paragraph: select the
- * exact range in the block, click the toolbar control. Links go through the
- * link dialog (two inputs + 插入 button; the display-text input is the one
- * prefilled with the selection, the other is the URL).
+ * Style the link / bold / italic runs of a JUST-TYPED paragraph or quote:
+ * select the exact range in the block, click the toolbar control. Links go
+ * through the link dialog (two inputs + 插入 button; the display-text input is
+ * the one prefilled with the selection, the other is the URL).
+ *
+ * ALWAYS collapses the selection on exit (success or bail) — a held selection
+ * makes the caller's next Enter/insertText delete the styled text.
  */
 async function applyInlineRuns(
   client: CdpClient,
-  p: Extract<Block, { kind: 'paragraph' }>,
+  p: { text: string; runs: InlineRun[] },
   selectors: Selectors,
 ): Promise<void> {
   const styled = p.runs.filter((r) => r.url || r.bold || r.italic);
@@ -544,6 +611,7 @@ async function applyInlineRuns(
     if (r === styled[0]) break;
     prefix += r.text;
   }
+  try {
   for (const r of styled) {
     // select + verify + wait for the async DraftJS selectionchange sync
     let selOk = false;
@@ -613,38 +681,44 @@ async function applyInlineRuns(
       if (closed || hrefOk) console.log(`  ✓ link applied: ${r.text.slice(0, 25)} → ${r.url.slice(0, 40)}`);
       else console.warn(`  ! link apply unverified: ${r.text.slice(0, 25)}`);
     } else {
-      const tid = r.bold ? 'btn-bold' : 'btn-italic';
-      await client.eval(`(() => { const b = document.querySelector('[data-testid="${tid}"]'); if (b && b.offsetParent !== null) { b.click(); return true } return false })()`);
+      await clickToolbarInline(client, r);
       await sleep(300);
       console.log(`  ✓ ${r.bold ? 'bold' : 'italic'} applied: ${r.text.slice(0, 25)}`);
     }
     prefix += r.text;
   }
+  } finally {
+    // Selection hygiene: whatever happened above, leave a collapsed caret.
+    await collapseSelection(client);
+    await sleep(150);
+  }
 }
 
 /**
- * Style heading / list-item token blocks: caret into the token block (token
- * still selected via selectTokenExpr), apply the block style, then swap the
- * token for the real text. Headings: ## → 标题 (header-one), ### → 副标题
+ * Style heading / quote / list-item token blocks: caret into the token block
+ * (token still selected via selectTokenExpr), apply the block style, then swap
+ * the token for the real text. Headings: ## → 标题 (header-one), ### → 副标题
  * (header-two) via the 正文 dropdown (whose button label mirrors the current
- * block type, so match any of 正文/标题/副标题). Lists: btn-ul / btn-ol.
+ * block type, so match any of 正文/标题/副标题). Quotes: toolbar 引号 button
+ * (blockquote), then the quote's own bold/italic runs are styled too. Lists:
+ * btn-ul / btn-ol.
  */
 async function applyBlockStyles(
   client: CdpClient,
   blocks: Block[],
   selectors: Selectors,
 ): Promise<void> {
-  type StyleTarget = Extract<Block, { kind: 'heading' | 'listitem' }>;
+  type StyleTarget = Extract<Block, { kind: 'heading' | 'listitem' | 'quote' }>;
   const targets = blocks.filter(
-    (b): b is StyleTarget => b.kind === 'heading' || b.kind === 'listitem',
+    (b): b is StyleTarget => b.kind === 'heading' || b.kind === 'listitem' || b.kind === 'quote',
   );
   if (!targets.length) return;
-  console.log(`\n=== applyBlockStyles (${targets.length} heading/list blocks) ===`);
+  console.log(`\n=== applyBlockStyles (${targets.length} heading/quote/list blocks) ===`);
   let ok = 0;
   for (let i = 0; i < targets.length; i++) {
     const b = targets[i]!;
     const label = b.kind === 'heading' ? (b.level <= 2 ? '标题' : '副标题') : null;
-    console.log(`- [${i + 1}] ${b.kind}${b.kind === 'heading' ? b.level : b.ordered ? '(ol)' : '(ul)'}: ${b.text.slice(0, 30)}`);
+    console.log(`- [${i + 1}] ${b.kind}${b.kind === 'heading' ? b.level : b.kind === 'quote' ? '(quote)' : b.ordered ? '(ol)' : '(ul)'}: ${b.text.slice(0, 30)}`);
 
     // 1. select the token → caret inside the token block (focuses contenteditable)
     const pos = await selectTokenVerified(client, b.token, selectors);
@@ -656,7 +730,10 @@ async function applyBlockStyles(
 
     // 2. apply the block style to the current block
     let styled = false;
-    if (label) {
+    if (b.kind === 'quote') {
+      styled = await clickQuoteButton(client, selectors);
+      if (!styled) console.warn(`  ! quote button not found (check selectors.md quoteButton / aria-label)`);
+    } else if (label) {
       await client.eval(`(() => {
         const b = [...document.querySelectorAll('button')].find(x => ['正文','标题','副标题'].includes((x.innerText || '').trim()) && !x.dataset.testid);
         if (b) { b.click(); return true } return false;
@@ -695,6 +772,11 @@ async function applyBlockStyles(
     await client.insertText(b.text);
     await sleep(300);
 
+    // 3.5 quote: style its own bold/italic/link runs now that the text is in.
+    if (b.kind === 'quote' && b.runs.some((r) => r.bold || r.italic || r.url)) {
+      await applyInlineRuns(client, { text: b.text, runs: b.runs }, selectors);
+    }
+
     // 4. verify: token gone + block class changed from unstyled
     const state = await client.eval<{ gone: boolean; cls: string }>(`(() => {
       const c = document.querySelector(${JSON.stringify(selectors.composer)});
@@ -709,10 +791,11 @@ async function applyBlockStyles(
     const good =
       state?.gone &&
       styled &&
-      state.cls &&
       (b.kind === 'heading'
-        ? state.cls.includes('header')
-        : state.cls !== 'longform-unstyled');
+        ? !!state.cls && state.cls.includes('header')
+        : b.kind === 'quote'
+          ? true // quote class name not yet verified against live DOM — rely on styled+gone
+          : state.cls !== 'longform-unstyled');
     if (good) {
       ok++;
       console.log(`  ✓ styled (${state.cls})`);
@@ -1034,6 +1117,136 @@ async function insertImages(
   await snapshot(client, selectors, 'insertImages:after');
 }
 
+// ---------------------------------------------------------------------------
+// Tables → screenshot images (markdown tables have no X-native pipeline here)
+// ---------------------------------------------------------------------------
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/** Render one markdown table cell to HTML, honoring bold/italic/links. */
+function inlineHtml(cell: string): string {
+  let html = '';
+  for (const r of parseRuns(cell)) {
+    let t = escapeHtml(r.text);
+    if (r.url) t = `<a href="${escapeHtml(r.url)}" style="color:#1d9bf0;text-decoration:none">${t}</a>`;
+    if (r.bold) t = `<strong>${t}</strong>`;
+    if (r.italic) t = `<em>${t}</em>`;
+    html += t;
+  }
+  return html;
+}
+
+/** Standalone HTML page for one table, X-article look (≈720px body width). */
+function tableHtml(rows: string[][]): string {
+  const th = (c: string) =>
+    `<th style="border:1px solid #cfd9de;padding:8px 12px;background:#f7f9f9;text-align:left;font-weight:700;vertical-align:top">${inlineHtml(c)}</th>`;
+  const td = (c: string) =>
+    `<td style="border:1px solid #cfd9de;padding:8px 12px;vertical-align:top">${inlineHtml(c)}</td>`;
+  const [head, ...body] = rows;
+  const headRow = head ? `<tr>${head.map(th).join('')}</tr>` : '';
+  const bodyRows = body.map((r) => `<tr>${r.map(td).join('')}</tr>`).join('');
+  return `<!doctype html><html><head><meta charset="utf-8"><style>
+    html,body{margin:0;padding:0;background:#fff}
+    table{border-collapse:collapse;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
+      font-size:16px;line-height:1.5;color:#0f1419;width:max-content;max-width:720px;table-layout:auto}
+  </style></head><body><table>${headRow}${bodyRows}</table></body></html>`;
+}
+
+/**
+ * Render every markdown table to a PNG (HTML → separate Chrome tab →
+ * Page.captureScreenshot with viewport sized to content, @2x) and REPLACE the
+ * table block with a normal image block, so the already-verified image paste
+ * pipeline inserts it in place. On render failure the table degrades to
+ * plain-text row paragraphs (content never silently disappears).
+ */
+async function convertTablesToImages(
+  browser: CdpBrowser,
+  article: { blocks: Block[] },
+  mdDir: string,
+): Promise<void> {
+  const tables = article.blocks
+    .map((b, i) => ({ b, i }))
+    .filter((x): x is { b: Extract<Block, { kind: 'table' }>; i: number } => x.b.kind === 'table');
+  if (!tables.length) return;
+  console.log(`\n=== convertTablesToImages (${tables.length} tables → PNG) ===`);
+
+  let imgTotal = article.blocks.filter((b) => b.kind === 'image').length;
+
+  for (let n = 0; n < tables.length; n++) {
+    const { b, i } = tables[n]!;
+    const htmlPath = path.join(mdDir, `_jptx_table_${n + 1}.html`);
+    const pngPath = path.join(mdDir, `_jptx_table_${n + 1}.png`);
+    let done = false;
+    try {
+      await writeFile(htmlPath, tableHtml(b.rows), 'utf-8');
+      // Separate tab so the draft tab is never navigated away.
+      const { targetId } = await browser.send<{ targetId: string }>('Target.createTarget', {
+        url: 'about:blank',
+      });
+      const { sessionId } = await browser.send<{ sessionId: string }>(
+        'Target.attachToTarget',
+        { targetId, flatten: true },
+      );
+      const t = new CdpClient(browser, sessionId);
+      await t.enable();
+      try {
+        await t.navigate(pathToFileURL(htmlPath).href);
+        await t.waitFor('!!document.querySelector("table")', 10_000);
+        await sleep(400); // fonts settle
+        const dim = await t.eval<{ w: number; h: number }>(
+          `(() => { const e = document.documentElement;
+             return { w: Math.max(e.scrollWidth, document.body.scrollWidth),
+                      h: Math.max(e.scrollHeight, document.body.scrollHeight) }; })()`,
+        );
+        await t.send('Emulation.setDeviceMetricsOverride', {
+          width: Math.ceil(dim.w),
+          height: Math.ceil(dim.h),
+          deviceScaleFactor: 2,
+          mobile: false,
+        });
+        await sleep(300);
+        const { data } = await t.send<{ data: string }>('Page.captureScreenshot', {
+          format: 'png',
+        });
+        await writeFile(pngPath, Buffer.from(data, 'base64'));
+        done = fs.existsSync(pngPath);
+      } finally {
+        await browser.send('Target.closeTarget', { targetId }).catch(() => {});
+      }
+    } catch (e) {
+      console.warn(`  ! table ${n + 1} render failed: ${(e as Error).message}`);
+    }
+
+    if (done) {
+      imgTotal++;
+      article.blocks[i] = {
+        kind: 'image',
+        path: pngPath,
+        raw: b.raw.join(' ').slice(0, 60),
+        token: imageToken(imgTotal),
+      };
+      console.log(`  ✓ table ${n + 1} → ${path.basename(pngPath)} (${b.rows.length} rows)`);
+    } else {
+      // Degrade to plain-text paragraphs — never lose content silently.
+      console.warn(`  ! table ${n + 1} downgraded to plain-text paragraphs`);
+      const paras: Block[] = b.rows.map((row) => {
+        const text = row.map((c) => parseRuns(c).map((r) => r.text).join('')).join('　|　');
+        return { kind: 'paragraph', text, runs: [{ text }] } as Block;
+      });
+      article.blocks.splice(i, 1, ...paras);
+      // spliced indices after this one shifted — recompute remaining targets.
+      for (let m = n + 1; m < tables.length; m++) tables[m]!.i += paras.length - 1;
+    }
+  }
+}
+
+
 async function uploadCover(
   client: CdpClient,
   coverPath: string,
@@ -1126,16 +1339,13 @@ async function main() {
 
   console.log('[parse]', args.mdPath);
   const article = parseArticle(args.mdPath);
-  const imageBlocks = article.blocks.filter(
-    (b): b is Block & { kind: 'image' } => b.kind === 'image',
-  );
   const codeBlocks = article.blocks.filter(
     (b): b is Block & { kind: 'code' } => b.kind === 'code',
   );
   console.log(`  title: ${article.title}`);
   console.log(`  cover: ${article.coverImage ?? '(none)'}`);
   console.log(
-    `  blocks: ${article.blocks.length} (${imageBlocks.length} images, ${codeBlocks.length} code)`,
+    `  blocks: ${article.blocks.length} (${article.blocks.filter((b) => b.kind === 'image').length} images, ${codeBlocks.length} code, ${article.blocks.filter((b) => b.kind === 'table').length} tables)`,
   );
 
   // Pre-flight: every image and cover must resolve to a real file. Catches
@@ -1144,7 +1354,7 @@ async function main() {
   if (article.coverImage && !fs.existsSync(article.coverImage)) {
     missing.push(`cover: ${article.coverImage}`);
   }
-  for (const im of imageBlocks) {
+  for (const im of article.blocks.filter((b): b is Block & { kind: 'image' } => b.kind === 'image')) {
     if (!fs.existsSync(im.path)) missing.push(`image (${im.raw}): ${im.path}`);
   }
   if (missing.length) {
@@ -1164,6 +1374,13 @@ async function main() {
   });
 
   try {
+    // Tables first: rendered to PNGs in a side tab, then treated as body
+    // images by everything below (including the audit).
+    await convertTablesToImages(browser, article, path.dirname(path.resolve(args.mdPath)));
+    const imageBlocks = article.blocks.filter(
+      (b): b is Block & { kind: 'image' } => b.kind === 'image',
+    );
+
     await createDraft(client, selectors);
     await fillTitle(client, article.title, selectors);
     await fillBody(client, article.blocks, selectors, path.basename(args.profileDir));

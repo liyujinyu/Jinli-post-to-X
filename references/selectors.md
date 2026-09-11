@@ -44,6 +44,13 @@
   // 正文配图计数选择器（验证插图成功）
   "composerImages": "[data-testid=\"composer\"] img",
 
+  // 工具栏引号（blockquote）按钮候选；都 miss 时脚本还会按 aria-label
+  // /引用|引用文|blockquote|quote/i 兜底查找
+  "quoteButton": [
+    "[data-testid=\"btn-block-quote\"]",
+    "[data-testid=\"btn-quote\"]"
+  ],
+
   // 发布按钮的可选可见文本（toolbar 与 confirm dialog 复用）
   "publishText": ["发布", "Publish", "公開", "게시"]
 }

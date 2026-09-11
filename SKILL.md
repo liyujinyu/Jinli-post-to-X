@@ -26,6 +26,12 @@ cover_image: attachments/cover.png   # 可选;或把封面图写在正文第一�
 
 正文第一段。**加粗**可以。
 
+> 引用块(连续 `>` 行合并为一块),引用内的**加粗**/*斜体*/[链接](https://x.com) 也会保留——脚本点工具栏「引号」按钮上样式。
+
+| 列A | 列B |                                                        ← 表格:自动渲染成 X 风格 PNG 截图插入(保留表内加粗/链接)
+|-----|-----|
+| a   | **b** |
+
 ![[imgs/a.png]]        ← Obsidian wikilink,或
 ![](imgs/b.png)        ← 标准语法;每张图会插在它「上一段」之后
 
@@ -76,7 +82,7 @@ bun "${SKILL_DIR}/scripts/audit.ts" "创作输出/我的长文.md" 2096095610722
 | `${SKILL_DIR}/scripts/publish.ts` | 编排 | CLI 入口,串联全流程,停在草稿,每步打快照 |
 | `${SKILL_DIR}/scripts/cdp.ts` | 稳定 | 裸 WebSocket CDP(连/eval/坐标点击/insertText/截图)|
 | `${SKILL_DIR}/scripts/os-clipboard.ts` | 稳定 | OS 级:写图剪贴板 + 激活窗口(AttachThreadInput)+ SendKeys + `pasteImage`(原子删+粘)|
-| `${SKILL_DIR}/scripts/markdown.ts` | 稳定 | 无依赖解析:frontmatter + 段落/标题/列表/链接 + 图片/代码块占位符(首图自动提为封面)|
+| `${SKILL_DIR}/scripts/markdown.ts` | 稳定 | 无依赖解析:frontmatter + 段落/标题/列表/引用/表格/链接 + 图片/代码块占位符(首图自动提为封面)|
 | `${SKILL_DIR}/scripts/audit.ts` | 稳定 | 终审校验:草稿 DOM vs 源 markdown(块序/计数/token/链接),publish 末尾自动跑,也可单独复检 |
 | `${SKILL_DIR}/scripts/package.json` | — | 无外部依赖 |
 
@@ -88,6 +94,8 @@ bun "${SKILL_DIR}/scripts/audit.ts" "创作输出/我的长文.md" 2096095610722
 4. **每步可验证**:每步打印快照(img 计数/URL),失败可定位。
 5. **终审校验闸门**:装配完自动跑 `audit.ts` 全量比对(块序/计数/链接/token 残留),不一致逐条点名——问题在发布前被脚本抓住,不靠作者肉眼。
 6. **不发布**:停在草稿,作者手动发布。
+7. **选区卫生(2026-09-11 修复)**:任何工具栏操作(加粗/斜体/链接/引号)之后**必须收起选区**再按 Enter/输入下一块——持握的选区会让下一次输入**删除刚加粗的文字**。新增 `collapseSelection` 在 `applyInlineRuns` 出口和 `fillBody` 每块之前强制执行。
+8. **表格 → 截图**:markdown 表格在侧 tab 渲染成 X 风格 HTML(720px、表内加粗/链接保留)→ `Page.captureScreenshot` @2x → 当作普通正文图走已验证的粘贴管线;渲染失败时降级为纯文本段落,内容不丢。中间产物 `_jptx_table_N.html/.png` 留在 md 同目录备查。
 
 ## 参考
 
