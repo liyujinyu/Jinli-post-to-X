@@ -55,6 +55,7 @@ export type Block =
   | { kind: 'heading'; level: number; text: string; token: string }
   | { kind: 'quote'; text: string; runs: InlineRun[]; token: string }
   | { kind: 'listitem'; ordered: boolean; text: string; token: string }
+  | { kind: 'hr'; token: string }
   | { kind: 'table'; rows: string[][]; raw: string[]; token: string }
   | { kind: 'image'; path: string; raw: string; token: string }
   | { kind: 'code'; lang: string; text: string; token: string };
@@ -94,6 +95,11 @@ export function quoteToken(i: number): string {
 /** Token for table #`i` (1-based) — replaced by a rendered screenshot image. */
 export function tableToken(i: number): string {
   return `XAP-TBL-${i}-PLACEHOLDER`;
+}
+
+/** Token for horizontal rule #`i` (1-based) — replaced by 插入→分割线. */
+export function hrToken(i: number): string {
+  return `XAP-HR-${i}-PLACEHOLDER`;
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +258,7 @@ export function parseArticle(mdPath: string): ParsedArticle {
   let listCount = 0;
   let quoteCount = 0;
   let tableCount = 0;
+  let hrCount = 0;
 
   // Quote buffering: consecutive "> " lines merge into ONE quote block
   // (matching how Obsidian renders a multi-line quote).
@@ -363,6 +370,30 @@ export function parseArticle(mdPath: string): ParsedArticle {
         text: stripInline(head[2] ?? ''),
         token: headingToken(headingCount),
       });
+      continue;
+    }
+
+    // Horizontal rule: a lone --- / *** / ___ line. If a text line directly
+    // precedes it (no blank line), that's setext H2 ("text" + "---") —
+    // promote the pending paragraph to a heading instead of emitting an HR
+    // (otherwise the divider would cut the sentence in two).
+    const hr = line.trim().match(/^(-{3,}|\*{3,}|_{3,})$/);
+    if (hr) {
+      flushQuote();
+      flushTable();
+      if (pendingParagraph.trim()) {
+        headingCount++;
+        blocks.push({
+          kind: 'heading',
+          level: 2,
+          text: stripInline(pendingParagraph.trim()),
+          token: headingToken(headingCount),
+        });
+        pendingParagraph = '';
+      } else {
+        hrCount++;
+        blocks.push({ kind: 'hr', token: hrToken(hrCount) });
+      }
       continue;
     }
 

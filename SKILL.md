@@ -32,6 +32,8 @@ cover_image: attachments/cover.png   # 可选;或把封面图写在正文第一�
 |-----|-----|
 | a   | **b** |
 
+---                                                                  ← 分割线:自动走「插入→分割线」生成原生 divider(文字紧跟 --- 则按 setext 二级标题处理)
+
 ![[imgs/a.png]]        ← Obsidian wikilink,或
 ![](imgs/b.png)        ← 标准语法;每张图会插在它「上一段」之后
 
@@ -94,8 +96,9 @@ bun "${SKILL_DIR}/scripts/audit.ts" "创作输出/我的长文.md" 2096095610722
 4. **每步可验证**:每步打印快照(img 计数/URL),失败可定位。
 5. **终审校验闸门**:装配完自动跑 `audit.ts` 全量比对(块序/计数/链接/token 残留),不一致逐条点名——问题在发布前被脚本抓住,不靠作者肉眼。
 6. **不发布**:停在草稿,作者手动发布。
-7. **选区卫生(2026-09-11 修复)**:任何工具栏操作(加粗/斜体/链接/引号)之后**必须收起选区**再按 Enter/输入下一块——持握的选区会让下一次输入**删除刚加粗的文字**。新增 `collapseSelection` 在 `applyInlineRuns` 出口和 `fillBody` 每块之前强制执行。
+7. **选区卫生(2026-09-13 二次修复)**:工具栏操作(加粗/斜体/链接/引号)之后,光标必须回到**本块末尾**(`caretToEndOfBlock`)再按 Enter——收起在 run 末尾会让 Enter 把段落**从粗体后面劈开**(第一次修复只收起选区,恰恰引入了这个 bug);不收起则会**删除选中文字**。`applyInlineRuns` 的 try/finally 出口强制执行,失败兜底 `collapseSelection` 并告警。
 8. **表格 → 截图**:markdown 表格在侧 tab 渲染成 X 风格 HTML(720px、表内加粗/链接保留)→ `Page.captureScreenshot` @2x → 当作普通正文图走已验证的粘贴管线;渲染失败时降级为纯文本段落,内容不丢。中间产物 `_jptx_table_N.html/.png` 留在 md 同目录备查。
+9. **分割线(2026-09-13)**:独立 `---`/`***`/`___` 行 → `insertHrBlocks` 走「插入→分割线」原生 divider(菜单文本 分割线/Divider 多语言兜底),token 清理复用代码卡的 OS 删除流程;文字紧跟 `---`(无空行)按 setext H2 处理,避免句子被 divider 劈断。audit 按 `<hr>` 元素识别 HR 块。
 
 ## 参考
 

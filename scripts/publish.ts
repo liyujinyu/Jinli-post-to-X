@@ -344,7 +344,6 @@ async function snapshot(client: CdpClient, selectors: Selectors, label: string):
  * Collapse the DOM selection to its end. CRITICAL after any toolbar action:
  * a held selection makes the next CDP Input.insertText / Enter keypress
  * DELETE the selected text (browser input replaces the active selection).
- * This is what made bold runs vanish mid-article.
  */
 async function collapseSelection(client: CdpClient): Promise<void> {
   await client.eval(
@@ -354,6 +353,52 @@ async function collapseSelection(client: CdpClient): Promise<void> {
          s.removeAllRanges(); s.addRange(r);
        } return true; })()`,
   ).catch(() => {});
+}
+
+/**
+ * Place a COLLAPSED caret at the very END of the block whose textContent
+ * equals `blockText`. CRITICAL before the caller's Enter: after styling an
+ * inline run the caret sits at the END OF THE RUN (mid-paragraph) — pressing
+ * Enter there SPLITS the paragraph right after the bold text (the reported
+ * "黑体字后边断了" bug). The caret must return to the block end first.
+ */
+async function caretToEndOfBlock(
+  client: CdpClient,
+  blockText: string,
+  selectors: Selectors,
+): Promise<boolean> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const ok = await client.eval<boolean>(
+      `(() => {
+        const composer = document.querySelector(${JSON.stringify(selectors.composer)});
+        if (!composer) return false;
+        const blocks = [...composer.querySelectorAll(${JSON.stringify(selectors.block)})];
+        const full = ${JSON.stringify(blockText)};
+        let b = blocks.find(x => (x.textContent || '') === full);
+        if (!b && full.length > 15) b = blocks.find(x => (x.textContent || '').startsWith(full.slice(0, 15)));
+        if (!b) return false;
+        const walker = document.createTreeWalker(b, NodeFilter.SHOW_TEXT);
+        let last = null, n;
+        while ((n = walker.nextNode())) last = n;
+        if (!last) return false;
+        const rg = document.createRange();
+        rg.setStart(last, (last.textContent || '').length);
+        rg.collapse(true);
+        const s = window.getSelection();
+        s.removeAllRanges(); s.addRange(rg);
+        const ce = b.closest(${JSON.stringify(selectors.contentEditable)}) || composer;
+        if (ce && ce.focus) ce.focus();
+        return s.toString() === '';
+      })()`,
+    ).catch(() => false);
+    if (ok) {
+      await sleep(350); // DraftJS syncs its internal selection from selectionchange async
+      const still = await client.eval<string>('window.getSelection().toString()').catch(() => 'x');
+      if (still === '') return true;
+    }
+    await sleep(300);
+  }
+  return false;
 }
 
 /** Toolbar bold/italic click with aria-label fallback (testid may change). */
@@ -688,9 +733,12 @@ async function applyInlineRuns(
     prefix += r.text;
   }
   } finally {
-    // Selection hygiene: whatever happened above, leave a collapsed caret.
-    await collapseSelection(client);
-    await sleep(150);
+    // Selection hygiene: caret must end at the END OF THE BLOCK — a caret left
+    // at the end of the styled run (mid-paragraph) makes the caller's Enter
+    // SPLIT the paragraph right after the bold/italic/link text.
+    const parked = await caretToEndOfBlock(client, p.text, selectors).catch(() => false);
+    if (!parked) await collapseSelection(client); // last resort (may split — logged upstream)
+    await sleep(200);
   }
 }
 
@@ -1021,6 +1069,147 @@ async function insertCodeBlocks(
   }
   console.log(`  code cards inserted: ${ok}/${codeBlocks.length}`);
   await snapshot(client, selectors, 'insertCodeBlocks:after');
+}
+
+/**
+ * Phase 1.6: replace each HR token with a native X divider (插入 → 分割线).
+ *
+ * Same verified flow as code cards: COLLAPSED caret inside the token block,
+ * open the 插入 dropdown, click 分割线 (inserts immediately — no dialog
+ * expected), then remove the leftover token block (selectNodeContents +
+ * OS DELETE + Backspace). Divider presence is verified by counting <hr>
+ * elements in the composer.
+ */
+async function insertHrBlocks(
+  client: CdpClient,
+  hrBlocks: Block[],
+  selectors: Selectors,
+  profileMarker: string,
+): Promise<void> {
+  if (!hrBlocks.length) return;
+  console.log(`\n=== insertHrBlocks (${hrBlocks.length}, 插入→分割线) ===`);
+  let ok = 0;
+  for (let i = 0; i < hrBlocks.length; i++) {
+    const hb = hrBlocks[i] as Extract<Block, { kind: 'hr' }>;
+    console.log(`- token[${i + 1}] ${hb.token}`);
+
+    const countHrs = async (): Promise<number> =>
+      client.eval<number>(
+        `document.querySelectorAll(${JSON.stringify(selectors.composer)} hr).length`,
+      );
+
+    let done = false;
+    for (let attempt = 0; attempt < 2 && !done; attempt++) {
+      // Step 1: collapsed caret inside the token block (a held selection makes
+      // the 插入 menu fail to open — same verified failure mode as code cards).
+      const prep = await client.eval<string>(
+        `(() => { try {
+          const c = document.querySelector(${JSON.stringify(selectors.composer)});
+          if (!c) return 'NOCOMPOSER';
+          const b = [...c.querySelectorAll(${JSON.stringify(selectors.block)})]
+            .find(x => (x.innerText || '').includes(${JSON.stringify(hb.token)}));
+          if (!b) return 'NOBLOCK';
+          b.scrollIntoView({ block: 'center' });
+          const walker = document.createTreeWalker(b, NodeFilter.SHOW_TEXT);
+          const tn = walker.nextNode();
+          const rg = document.createRange();
+          if (tn) { rg.setStart(tn, 0); rg.collapse(true); }
+          else { rg.selectNodeContents(b); rg.collapse(true); }
+          const s = window.getSelection();
+          s.removeAllRanges(); s.addRange(rg);
+          b.closest('[contenteditable="true"]')?.focus();
+          return 'OK';
+        } catch (e) { return 'ERR:' + e.message; } })()`,
+      );
+      if (prep !== 'OK') {
+        console.warn(`  ! caret prep failed (${prep}, attempt ${attempt + 1})`);
+        continue;
+      }
+      await sleep(450);
+
+      // Step 2: 插入 → 分割线 (multi-locale menu text fallbacks).
+      const before = await countHrs();
+      await client.eval(`(() => { const b=[...document.querySelectorAll('button')]
+        .find(x => (x.innerText || '').trim() === '插入'); if (b) b.click(); })()`);
+      await sleep(800);
+      const menu = await client.eval<string>(`(() => {
+        const items = [...document.querySelectorAll('[role="menuitem"], [role="option"]')];
+        const m = items.find(x => ['分割线','Divider','区切り線','구분선'].includes((x.innerText || '').trim()));
+        if (!m) return 'NOMENU';
+        m.click(); return 'OK'; })()`);
+      if (menu !== 'OK') {
+        console.warn(`  ! insert menu failed (${menu}, attempt ${attempt + 1})`);
+        await client.eval(`document.body.click()`).catch(() => {});
+        continue;
+      }
+      await sleep(1000);
+
+      // Unexpected dialog (menu shape changed)? close and bail this attempt.
+      const dialogOpen = await client.eval<boolean>(`!!document.querySelector('[role="dialog"]')`);
+      if (dialogOpen) {
+        console.warn(`  ! 分割线 opened an unexpected dialog — closing`);
+        await client.eval(`document.querySelector('[data-testid="app-bar-close"]')?.click(); true`);
+        await sleep(400);
+        continue;
+      }
+
+      // Step 3: remove the leftover token block (OS DELETE + Backspace).
+      const held = await client.eval<string>(
+        `(() => { try {
+          const c = document.querySelector(${JSON.stringify(selectors.composer)});
+          const b = [...c.querySelectorAll(${JSON.stringify(selectors.block)})]
+            .find(x => (x.innerText || '').includes(${JSON.stringify(hb.token)}));
+          if (!b) return 'GONE';
+          const rg = document.createRange(); rg.selectNodeContents(b);
+          const s = window.getSelection(); s.removeAllRanges(); s.addRange(rg);
+          b.closest('[contenteditable="true"]')?.focus();
+          return s.toString().length > 0 ? 'HELD' : 'EMPTY';
+        } catch (e) { return 'ERR:' + e.message; } })()`,
+      );
+      if (held === 'HELD') {
+        await sleep(400);
+        await client.bringToFront();
+        await sleep(250);
+        await deleteSelection(3, profileMarker);
+        await sleep(1200);
+      }
+      const caret = await client.eval<string>(
+        `(() => { const c = document.querySelector(${JSON.stringify(selectors.composer)});
+          const b = [...c.querySelectorAll(${JSON.stringify(selectors.block)})]
+            .find(x => (x.innerText || '').includes(${JSON.stringify(hb.token)}));
+          if (!b) return 'GONE';
+          const rg = document.createRange(); rg.selectNodeContents(b); rg.collapse(true);
+          const s = window.getSelection(); s.removeAllRanges(); s.addRange(rg);
+          b.closest('[contenteditable="true"]')?.focus();
+          return 'CARET'; })()`,
+      );
+      if (caret === 'CARET') {
+        await sleep(400);
+        await client.bringToFront();
+        await sleep(250);
+        await sendKeys('{BS}', profileMarker);
+        await sleep(1300);
+      }
+
+      // Verify: token gone AND an <hr> appeared.
+      const state = await client.eval<{ gone: boolean; hrs: number }>(
+        `(() => {
+          const c = document.querySelector(${JSON.stringify(selectors.composer)});
+          const gone = !(c && (c.innerText || '').includes(${JSON.stringify(hb.token)}));
+          return { gone, hrs: c ? c.querySelectorAll('hr').length : 0 };
+        })()`,
+      );
+      if (state?.gone && state.hrs > before) {
+        done = true;
+        console.log(`  ✓ divider inserted (${before} → ${state.hrs} hr)`);
+      } else if (attempt === 1) {
+        console.warn(`  ! verify failed (gone=${state?.gone}, hr ${before}→${state?.hrs})`);
+      }
+    }
+    if (done) ok++;
+  }
+  console.log(`  dividers inserted: ${ok}/${hrBlocks.length}`);
+  await snapshot(client, selectors, 'insertHrBlocks:after');
 }
 
 /**
@@ -1387,7 +1576,13 @@ async function main() {
     if (codeBlocks.length) {
       await insertCodeBlocks(client, codeBlocks, selectors, path.basename(args.profileDir));
     }
-    // Headings + list items: style the token blocks, then swap in real text.
+    const hrBlocks = article.blocks.filter(
+      (b): b is Block & { kind: 'hr' } => b.kind === 'hr',
+    );
+    if (hrBlocks.length) {
+      await insertHrBlocks(client, hrBlocks, selectors, path.basename(args.profileDir));
+    }
+    // Headings + quotes + list items: style the token blocks, then swap in real text.
     await applyBlockStyles(client, article.blocks, selectors);
     if (imageBlocks.length && !args.noImages) {
       await insertImages(client, imageBlocks, selectors, path.basename(args.profileDir));

@@ -43,6 +43,8 @@ function expectedKind(b: Block): string {
       return 'QUOTE';
     case 'code':
       return 'CODE';
+    case 'hr':
+      return 'HR';
     case 'image':
       return 'IMG';
     case 'table':
@@ -65,6 +67,7 @@ function dumpExpr(composer: string): string {
     all.forEach((b, i) => {
       let kind = null;
       if (b.querySelector('img')) kind = 'IMG';
+      else if (b.querySelector('hr')) kind = 'HR';
       else if (b.querySelector('button[aria-label="编辑块"]')) kind = 'CODE';
       else {
         const cls = b.className || '';
@@ -178,7 +181,7 @@ export async function auditDraft(
   const expected = article.blocks.map(expectedKind);
   const count = (arr: string[], k: string) => arr.filter(x => x === k).length;
   const actual = dom.blocks.map(b => b.kind);
-  for (const k of ['H1', 'H2', 'UL', 'OL', 'QUOTE', 'CODE', 'IMG', 'P']) {
+  for (const k of ['H1', 'H2', 'UL', 'OL', 'QUOTE', 'CODE', 'HR', 'IMG', 'P']) {
     const e = count(expected, k), a = count(actual, k);
     add(`数量 ${k}`, e === a, `期望 ${e} / 实际 ${a}`);
   }
@@ -202,7 +205,7 @@ export async function auditDraft(
     let textBad = 0;
     for (let i = 0; i < article.blocks.length; i++) {
       const b = article.blocks[i];
-      if (b.kind === 'image' || b.kind === 'code' || b.kind === 'table') continue;
+      if (b.kind === 'image' || b.kind === 'code' || b.kind === 'table' || b.kind === 'hr') continue;
       const want = normalize(b.text);
       if (want && normalize(dom.blocks[i].text) !== want) {
         textBad++;
