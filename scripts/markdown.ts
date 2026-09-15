@@ -192,7 +192,9 @@ const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
  *   - bare Obsidian wikilink names (searched from the markdown dir then cwd).
  */
 function resolveImagePath(ref: string, mdDir: string): string | null {
-  const cleaned = ref.trim().replace(/^["']|["']$/g, '');
+  // Obsidian embeds may use an alias or display size: ![[image.png|caption]] / ![[image.png|300]].
+  // The part after the first pipe is display metadata, not part of the file path.
+  const cleaned = ref.trim().replace(/^["']|["']$/g, '').split('|', 1)[0].trim();
   if (!cleaned) return null;
 
   const candidates: string[] = [];
