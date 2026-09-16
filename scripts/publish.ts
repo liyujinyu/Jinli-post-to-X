@@ -477,8 +477,19 @@ async function createDraft(client: CdpClient, selectors: Selectors): Promise<voi
     if (clicked) console.log('[createDraft] Clicked article compose link');
   }
   if (!clicked) {
+    const diag = await client.eval<{ url: string; title: string; text: string; controls: string[] }>(`(() => ({
+      url: location.href,
+      title: document.title,
+      text: (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 800),
+      controls: [...document.querySelectorAll('button, a')]
+        .filter(x => x.offsetParent !== null)
+        .map(x => [x.tagName, x.getAttribute('data-testid') || '', x.getAttribute('aria-label') || '', (x.innerText || '').trim()].join('|'))
+        .filter(Boolean)
+        .slice(0, 80),
+    }))()`);
+    console.error('[createDraft:diagnostic]', JSON.stringify(diag));
     throw new Error(
-      'Could not find the Write button on x.com/compose/articles. Update selectors.md or open the editor manually.',
+      'Could not find the Write button on x.com/compose/articles. See createDraft:diagnostic for login/page/selector details.',
     );
   }
 
@@ -972,25 +983,17 @@ async function insertCodeBlocks(
       }
       await sleep(1500);
 
-      // Step 4: clear the leftover token block (text via OS DELETE).
-      const held = await client.eval<string>(
-        `(() => { try {
-          const c = document.querySelector(${JSON.stringify(selectors.composer)});
-          const b = [...c.querySelectorAll('[data-block="true"]')]
-            .find(x => (x.innerText || '').includes(${JSON.stringify(cb.token)}));
-          if (!b) return 'GONE';
-          const rg = document.createRange(); rg.selectNodeContents(b);
-          const s = window.getSelection(); s.removeAllRanges(); s.addRange(rg);
-          b.closest('[contenteditable="true"]')?.focus();
-          return s.toString().length > 0 ? 'HELD' : 'EMPTY';
-        } catch (e) { return 'ERR:' + e.message; } })()`,
-      );
-      if (held === 'HELD') {
-        await sleep(400);
+      // Step 4: clear ONLY the exact leftover token. A broad
+      // selectNodeContents + OS DELETE can use DraftJS's stale internal
+      // selection after the dialog closes and erase every block below it.
+      const tokenSelected = await selectTokenVerified(client, cb.token, selectors, 6);
+      if (tokenSelected) {
         await client.bringToFront();
         await sleep(250);
         await deleteSelection(1, profileMarker);
         await sleep(1200);
+      } else {
+        console.warn(`  ! exact code token selection failed; leaving token in place to protect following content`);
       }
       // Backspace the now-empty block so no stray blank line keeps block styles.
       const caret = await client.eval<string>(
@@ -1153,25 +1156,16 @@ async function insertHrBlocks(
         continue;
       }
 
-      // Step 3: remove the leftover token block (OS DELETE + Backspace).
-      const held = await client.eval<string>(
-        `(() => { try {
-          const c = document.querySelector(${JSON.stringify(selectors.composer)});
-          const b = [...c.querySelectorAll(${JSON.stringify(selectors.block)})]
-            .find(x => (x.innerText || '').includes(${JSON.stringify(hb.token)}));
-          if (!b) return 'GONE';
-          const rg = document.createRange(); rg.selectNodeContents(b);
-          const s = window.getSelection(); s.removeAllRanges(); s.addRange(rg);
-          b.closest('[contenteditable="true"]')?.focus();
-          return s.toString().length > 0 ? 'HELD' : 'EMPTY';
-        } catch (e) { return 'ERR:' + e.message; } })()`,
-      );
-      if (held === 'HELD') {
-        await sleep(400);
+      // Step 3: remove ONLY the exact HR token. Never issue OS DELETE from an
+      // unverified DOM range: DraftJS may still hold a stale selection.
+      const tokenSelected = await selectTokenVerified(client, hb.token, selectors, 6);
+      if (tokenSelected) {
         await client.bringToFront();
         await sleep(250);
         await deleteSelection(3, profileMarker);
         await sleep(1200);
+      } else {
+        console.warn(`  ! exact HR token selection failed; leaving token in place to protect following content`);
       }
       const caret = await client.eval<string>(
         `(() => { const c = document.querySelector(${JSON.stringify(selectors.composer)});
