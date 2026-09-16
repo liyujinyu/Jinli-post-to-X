@@ -445,10 +445,24 @@ async function clickQuoteButton(client: CdpClient, selectors: Selectors): Promis
 
 async function createDraft(client: CdpClient, selectors: Selectors): Promise<void> {
   console.log('\n=== createDraft ===');
+  const titlePresent = `(()=>{ const sels=${jsList(selectors.titleInput)}; return ${anySelectorExpr(selectors.titleInput)}; })()`;
+  const currentUrl = await client.eval<string>('location.href').catch(() => '');
+  if (/\/compose\/articles\/edit\//.test(currentUrl)) {
+    console.log(`[createDraft] Recovering existing edit page: ${currentUrl}`);
+    if (!(await client.waitFor(titlePresent, 15_000).catch(() => false))) {
+      await client.navigate(currentUrl);
+    }
+    if (await client.waitFor(titlePresent, 90_000).catch(() => false)) {
+      console.log('[createDraft] Existing editor recovered');
+      await snapshot(client, selectors, 'createDraft:after');
+      return;
+    }
+    console.warn('[createDraft] Existing edit page did not mount; returning to article list');
+  }
+
   await client.navigate('https://x.com/compose/articles');
   await sleep(3000);
 
-  const titlePresent = `(()=>{ const sels=${jsList(selectors.titleInput)}; return ${anySelectorExpr(selectors.titleInput)}; })()`;
   // Already in the editor? (e.g. direct nav to an edit URL)
   if (await client.waitFor(titlePresent, 3000).catch(() => false)) {
     console.log('[createDraft] Editor already open');
@@ -500,11 +514,18 @@ async function createDraft(client: CdpClient, selectors: Selectors): Promise<voi
     `/compose\\/articles\\/edit\\//.test(location.href) && !!document.querySelector(${JSON.stringify(
       selectors.composer,
     )})`,
-    40_000,
+    90_000,
   );
   if (!editorReady) {
+    const diag = await client.eval<{ url: string; title: string; text: string; dialogs: string[] }>(`(() => ({
+      url: location.href,
+      title: document.title,
+      text: (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 1200),
+      dialogs: [...document.querySelectorAll('[role="dialog"]')].map(x => (x.innerText || '').replace(/\s+/g, ' ').slice(0, 500)),
+    }))()`);
+    console.error('[createDraft:after-click-diagnostic]', JSON.stringify(diag));
     throw new Error(
-      'Editor did not open after clicking Write. If this is the first run, sign in to X in the Chrome window, then re-run.',
+      'Editor did not open after clicking Write. See createDraft:after-click-diagnostic for login, dialog, or page state.',
     );
   }
   await snapshot(client, selectors, 'createDraft:after');
