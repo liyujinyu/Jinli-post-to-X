@@ -760,7 +760,32 @@ async function applyInlineRuns(
     } else {
       await clickToolbarInline(client, r);
       await sleep(300);
-      console.log(`  ✓ ${r.bold ? 'bold' : 'italic'} applied: ${r.text.slice(0, 25)}`);
+      // Honest verification — check <strong>/<em> OR the computed style of the
+      // run's text node (X may render inline styles with custom spans).
+      const tagSel = r.bold ? 'strong, b' : 'em, i';
+      const styleCheck = r.bold
+        ? 'parseInt(cs.fontWeight, 10) >= 600'
+        : "cs.fontStyle === 'italic'";
+      const verified = await client.eval<boolean>(
+        `(() => {
+          const composer = document.querySelector(${JSON.stringify(selectors.composer)});
+          if (!composer) return false;
+          const run = ${JSON.stringify(r.text)};
+          const byTag = [...composer.querySelectorAll('${tagSel}')].some(x => (x.textContent || '').includes(run));
+          if (byTag) return true;
+          const walker = document.createTreeWalker(composer, NodeFilter.SHOW_TEXT);
+          let n;
+          while ((n = walker.nextNode())) {
+            if ((n.textContent || '') === run && n.parentElement) {
+              const cs = getComputedStyle(n.parentElement);
+              if (${styleCheck}) return true;
+            }
+          }
+          return false;
+        })()`,
+      ).catch(() => false);
+      if (verified) console.log(`  ✓ ${r.bold ? 'bold' : 'italic'} applied: ${r.text.slice(0, 25)}`);
+      else console.warn(`  ! ${r.bold ? 'bold' : 'italic'} UNVERIFIED: ${r.text.slice(0, 25)}`);
     }
     prefix += r.text;
   }
@@ -771,6 +796,43 @@ async function applyInlineRuns(
     const parked = await caretToEndOfBlock(client, p.text, selectors).catch(() => false);
     if (!parked) await collapseSelection(client); // last resort (may split — logged upstream)
     await sleep(200);
+    // Style-inheritance kill switch (the "整段斜体/加粗连坐" bug): DraftJS derives
+    // the caret's currentInlineStyle from the char before it. When a bold/italic
+    // run reaches the END of the block (italic captions, whole-line bold), the
+    // parked caret keeps that style live — Enter + typing would style the NEXT
+    // block too, cascading through the rest of the article. Ask the browser what
+    // style is actually live at the block end (computed style of the LAST text
+    // node — ground truth, no guesswork), then toggle it OFF with Ctrl+B/Ctrl+I
+    // at the collapsed caret. If the style never applied, computed style is
+    // normal and we toggle nothing (so this can never ADD a wrong style).
+    const live = await client.eval<{ bold: boolean; italic: boolean } | null>(
+      `(() => {
+        const composer = document.querySelector(${JSON.stringify(selectors.composer)});
+        if (!composer) return null;
+        const blocks = [...composer.querySelectorAll('[data-block="true"]')];
+        const full = ${JSON.stringify(p.text)};
+        let b = blocks.find(x => (x.textContent || '') === full);
+        if (!b && full.length > 15) b = blocks.find(x => (x.textContent || '').startsWith(full.slice(0, 15)));
+        if (!b) return null;
+        const walker = document.createTreeWalker(b, NodeFilter.SHOW_TEXT);
+        let last = null, n;
+        while ((n = walker.nextNode())) last = n;
+        if (!last || !last.parentElement) return null;
+        const cs = getComputedStyle(last.parentElement);
+        return { bold: parseInt(cs.fontWeight, 10) >= 600, italic: cs.fontStyle === 'italic' };
+      })()`,
+    ).catch(() => null);
+    if (live && (live.bold || live.italic)) {
+      if (live.bold) {
+        await client.pressCtrlKey(66, 'b', 'KeyB').catch(() => {});
+        await sleep(150);
+      }
+      if (live.italic) {
+        await client.pressCtrlKey(73, 'i', 'KeyI').catch(() => {});
+        await sleep(150);
+      }
+      console.log(`  · killed live style at block end: ${[live.bold && 'bold', live.italic && 'italic'].filter(Boolean).join('+')}`);
+    }
   }
 }
 
@@ -799,6 +861,16 @@ async function applyBlockStyles(
     const b = targets[i]!;
     const label = b.kind === 'heading' ? (b.level <= 2 ? '标题' : '副标题') : null;
     console.log(`- [${i + 1}] ${b.kind}${b.kind === 'heading' ? b.level : b.kind === 'quote' ? '(quote)' : b.ordered ? '(ol)' : '(ul)'}: ${b.text.slice(0, 30)}`);
+
+    // Dead-page guard: same as insertCodeBlocks — if the editor unmounted,
+    // stop cleanly instead of burning into a fatal CDP timeout.
+    const composerUp = await client
+      .waitFor(`!!document.querySelector(${JSON.stringify(selectors.composer)})`, 15_000)
+      .catch(() => false);
+    if (!composerUp) {
+      console.warn(`  ! composer not present — editor likely reloaded; skipping remaining ${targets.length - i} block style(s)`);
+      break;
+    }
 
     // 1. select the token → caret inside the token block (focuses contenteditable)
     const pos = await selectTokenVerified(client, b.token, selectors);
@@ -918,6 +990,21 @@ async function insertCodeBlocks(
   for (let i = 0; i < codeBlocks.length; i++) {
     const cb = codeBlocks[i] as Extract<Block, { kind: 'code' }>;
     console.log(`- token[${i + 1}] ${cb.token} ← ${cb.lang || 'text'} (${cb.text.split('\n').length} lines)`);
+
+    // Dead-page guard (2026-09-20 crash): the editor can unmount mid-run
+    // (auto-save / remount) — poking a dead page produced a NOMENU→NOCOMPOSER
+    // cascade and eventually a fatal CDP timeout that killed the WHOLE run.
+    // If the composer won't come back within 15s, stop here and leave the
+    // remaining tokens for the audit to flag, instead of crashing the run.
+    const composerUp = await client
+      .waitFor(`!!document.querySelector(${JSON.stringify(selectors.composer)})`, 15_000)
+      .catch(() => false);
+    if (!composerUp) {
+      console.warn(
+        `  ! composer not present — editor likely reloaded; skipping remaining ${codeBlocks.length - i} code token(s)`,
+      );
+      break;
+    }
 
     let done = false;
     for (let attempt = 0; attempt < 2 && !done; attempt++) {

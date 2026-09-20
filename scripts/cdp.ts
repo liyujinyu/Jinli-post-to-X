@@ -245,19 +245,26 @@ export class CdpClient {
   }
 
   /** Press + release a character / virtual key cleanly. */
-  async pressKey(vk: number, key = '', code = ''): Promise<void> {
+  async pressKey(vk: number, key = '', code = '', modifiers = 0): Promise<void> {
     await this.send('Input.dispatchKeyEvent', {
       type: 'rawKeyDown',
       key,
       code,
       windowsVirtualKeyCode: vk,
+      modifiers,
     });
     await this.send('Input.dispatchKeyEvent', {
       type: 'keyUp',
       key,
       code,
       windowsVirtualKeyCode: vk,
+      modifiers,
     });
+  }
+
+  /** Ctrl+<key> — CDP modifiers bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8. */
+  async pressCtrlKey(vk: number, key: string, code: string): Promise<void> {
+    await this.pressKey(vk, key, code, 2);
   }
 
   /** Move + press + release at viewport coordinates — the reliable React click. */
