@@ -189,8 +189,52 @@ const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
  *   - already-absolute OS paths,
  *   - paths relative to the markdown file's directory,
  *   - paths relative to the vault root (process.cwd()),
- *   - bare Obsidian wikilink names (searched from the markdown dir then cwd).
+ *   - bare Obsidian wikilink names (vault-wide filename search, like Obsidian).
  */
+
+// Vault-wide filename index, built lazily on the first unresolved bare wikilink.
+// Map<lowercased filename, absolute paths[]> — Obsidian resolves ![[name.png]]
+// by unique filename anywhere in the vault, not just md dir / vault root.
+let vaultIndex: Map<string, string[]> | null = null;
+const VAULT_SKIP_DIRS = new Set(['.git', '.obsidian', '.claudian', '.trash', 'node_modules', '.claude']);
+
+function buildVaultIndex(): Map<string, string[]> {
+  const root = process.cwd();
+  const idx = new Map<string, string[]>();
+  const queue: string[] = [root];
+  while (queue.length) {
+    const dir = queue.shift()!;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        if (!VAULT_SKIP_DIRS.has(e.name) && !e.name.startsWith('.')) queue.push(p);
+      } else if (e.isFile()) {
+        const k = e.name.toLowerCase();
+        const list = idx.get(k);
+        if (list) list.push(p); else idx.set(k, [p]);
+      }
+    }
+  }
+  return idx;
+}
+
+function findInVault(ref: string, mdDir: string): string | null {
+  if (!vaultIndex) vaultIndex = buildVaultIndex();
+  const norm = ref.replace(/\\/g, '/').toLowerCase();
+  const base = norm.split('/').pop()!;
+  const hits = vaultIndex.get(base);
+  if (!hits || !hits.length) return null;
+  if (hits.length === 1) return hits[0];
+  // Ambiguous: prefer a path ending with the full ref (subpath match), then
+  // one inside the markdown's own folder tree, then the alphabetically first.
+  const sub = hits.find((h) => h.replace(/\\/g, '/').toLowerCase().endsWith('/' + norm));
+  if (sub) return sub;
+  const near = hits.find((h) => h.toLowerCase().startsWith(mdDir.toLowerCase()));
+  return near ?? hits.slice().sort()[0];
+}
+
 function resolveImagePath(ref: string, mdDir: string): string | null {
   // Obsidian embeds may use an alias or display size: ![[image.png|caption]] / ![[image.png|300]].
   // The part after the first pipe is display metadata, not part of the file path.
@@ -205,6 +249,9 @@ function resolveImagePath(ref: string, mdDir: string): string | null {
   for (const c of candidates) {
     if (fs.existsSync(c) && fs.statSync(c).isFile()) return c;
   }
+  // Bare Obsidian wikilink (![[name.png]]): search the whole vault by filename.
+  const vaultHit = findInVault(cleaned, mdDir);
+  if (vaultHit) return vaultHit;
   // If it looks like an image name but wasn't found, still return the best
   // guess so the caller can surface a clear error rather than a silent null.
   if (IMAGE_EXT.test(cleaned)) return candidates[candidates.length - 1];
