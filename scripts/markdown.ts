@@ -24,7 +24,10 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 
 /**
  * A block is one paragraph or one image, in document order. publish.ts fills the
@@ -235,11 +238,45 @@ function findInVault(ref: string, mdDir: string): string | null {
   return near ?? hits.slice().sort()[0];
 }
 
+// ---------------------------------------------------------------------------
+// Remote image download (2026-10-29)
+// X 上传走 Chrome 文件控件，只能吃本地文件。剪藏文章的配图常是 http(s) 外链，
+// 这里在解析阶段同步下载到临时缓存目录，后续流程（cover/上传/预检）无感复用。
+// ---------------------------------------------------------------------------
+
+const REMOTE_RE = /^https?:\/\//i;
+
+function downloadRemoteImage(url: string): string | null {
+  const cacheDir = path.join(os.tmpdir(), 'jinli-x-media');
+  const extMatch = url.match(/\.(png|jpe?g|webp|gif|bmp|svg)(?:[?#]|$)/i);
+  const ext = extMatch ? '.' + extMatch[1].replace(/^jpeg$/i, 'jpg') : '.png';
+  const key = crypto.createHash('md5').update(url).digest('hex').slice(0, 16);
+  const out = path.join(cacheDir, key + ext);
+  if (fs.existsSync(out) && fs.statSync(out).size > 0) return out; // 命中缓存
+  fs.mkdirSync(cacheDir, { recursive: true });
+  try {
+    // Windows 10+ 自带 curl.exe；-L 跟随重定向，--fail 让 HTTP 错误抛异常
+    execFileSync('curl', ['-sSL', '--fail', '-o', out, url], { timeout: 60_000, stdio: 'pipe' });
+  } catch {
+    try { fs.unlinkSync(out); } catch {}
+    return null;
+  }
+  return out;
+}
+
 function resolveImagePath(ref: string, mdDir: string): string | null {
   // Obsidian embeds may use an alias or display size: ![[image.png|caption]] / ![[image.png|300]].
   // The part after the first pipe is display metadata, not part of the file path.
   const cleaned = ref.trim().replace(/^["']|["']$/g, '').split('|', 1)[0].trim();
   if (!cleaned) return null;
+
+  // 远程图片：下载到本地临时目录再交给后续上传流程（2026-10-29 修复剪藏外链图）
+  if (REMOTE_RE.test(cleaned)) {
+    const local = downloadRemoteImage(cleaned);
+    if (local) return local;
+    console.warn(`  ! 远程图片下载失败，已跳过引用检查：${cleaned.slice(0, 80)}`);
+    return cleaned; // 交给 publish.ts 预检报明确的错，而不是静默丢图
+  }
 
   const candidates: string[] = [];
   if (path.isAbsolute(cleaned)) candidates.push(cleaned);
