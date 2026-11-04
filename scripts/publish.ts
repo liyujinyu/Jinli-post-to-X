@@ -74,7 +74,7 @@ function parseArgs(argv: string[]): Args {
     console.error('Usage: bun publish.ts <article.md> [--no-images] [--port 9222] [--profile <dir>] [--chrome <path>]');
     process.exit(1);
   }
-  return { mdPath: positional[0], noImages, pasteHtml, port, profileDir, chromePath };
+  return { mdPath: positional[0], noImages, pasteHtml, finishOnly, port, profileDir, chromePath };
 }
 
 // ---------------------------------------------------------------------------
@@ -1946,36 +1946,44 @@ async function main() {
       (b): b is Block & { kind: 'image' } => b.kind === 'image',
     );
 
-    await createDraft(client, selectors);
-    // 记录本run的草稿 id——后续所有阶段用它核对,防止 X 自动保存重载后
-    // 把页面重定向回「最近草稿」造成章节错位(2026-11-04 事故根因)。
-    const draftId = await client.eval<string | null>(DRAFT_ID_EXPR).catch(() => null);
-    console.log(`[draftId] ${draftId ?? '(unknown)'}`);
-    // 新鲜草稿守卫: X 会把上个会话的未保存内容恢复进「新建」的草稿
-    // (2026-11-04 双份文章叠写事故)。装配开始前草稿必须接近空白。
-    const prefill = await client
-      .eval<number>(
-        `((document.querySelector(${JSON.stringify(selectors.composer)})?.innerText || '').trim()).length`,
-      )
-      .catch(() => -1);
-    if (prefill < 0) throw new Error('createDraft 后找不到 composer');
-    if (prefill > 20) {
-      throw new Error(
-        `新草稿非空(${prefill} 字符)——X 恢复了上个会话的未保存内容。已中止;请先在编辑器里清空该恢复内容(或删除该草稿)再重跑。`,
-      );
-    }
-    await fillTitle(client, article.title, selectors);
-    if (args.pasteHtml) {
-      await pasteArticleHtml(
-        browser,
-        client,
-        article.blocks,
-        selectors,
-        path.basename(args.profileDir),
-        draftId,
-      );
+    let draftId: string | null = null;
+    if (args.finishOnly) {
+      // --finish-only: 内容已在草稿里(此前崩溃),只跑收尾阶段(分割线/图/封面/审计)。
+      await createDraft(client, selectors);
+      draftId = await client.eval<string | null>(DRAFT_ID_EXPR).catch(() => null);
+      console.log(`[draftId][finish-only] ${draftId ?? '(unknown)'}`);
     } else {
-      await fillBody(client, article.blocks, selectors, path.basename(args.profileDir), draftId);
+      await createDraft(client, selectors);
+      // 记录本run的草稿 id——后续所有阶段用它核对,防止 X 自动保存重载后
+      // 把页面重定向回「最近草稿」造成章节错位(2026-11-04 事故根因)。
+      draftId = await client.eval<string | null>(DRAFT_ID_EXPR).catch(() => null);
+      console.log(`[draftId] ${draftId ?? '(unknown)'}`);
+      // 新鲜草稿守卫: X 会把上个会话的未保存内容恢复进「新建」的草稿
+      // (2026-11-04 双份文章叠写事故)。装配开始前草稿必须接近空白。
+      const prefill = await client
+        .eval<number>(
+          `((document.querySelector(${JSON.stringify(selectors.composer)})?.innerText || '').trim()).length`,
+        )
+        .catch(() => -1);
+      if (prefill < 0) throw new Error('createDraft 后找不到 composer');
+      if (prefill > 20) {
+        throw new Error(
+          `新草稿非空(${prefill} 字符)——X 恢复了上个会话的未保存内容。已中止;请先在编辑器里清空该恢复内容(或删除该草稿)再重跑。`,
+        );
+      }
+      await fillTitle(client, article.title, selectors);
+      if (args.pasteHtml) {
+        await pasteArticleHtml(
+          browser,
+          client,
+          article.blocks,
+          selectors,
+          path.basename(args.profileDir),
+          draftId,
+        );
+      } else {
+        await fillBody(client, article.blocks, selectors, path.basename(args.profileDir), draftId);
+      }
     }
     if (codeBlocks.length) {
       await insertCodeBlocks(client, codeBlocks, selectors, path.basename(args.profileDir));
