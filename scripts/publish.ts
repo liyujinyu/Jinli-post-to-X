@@ -41,6 +41,7 @@ function relPath(p: string): string {
 type Args = {
   mdPath: string;
   noImages: boolean;
+  pasteHtml: boolean;
   port: number;
   profileDir: string;
   chromePath?: string;
@@ -49,6 +50,7 @@ type Args = {
 function parseArgs(argv: string[]): Args {
   const positional: string[] = [];
   let noImages = false;
+  let pasteHtml = false;
   let port = 9222;
   let profileDir = path.join(os.homedir(), '.local', 'share', 'x-browser-profile');
   let chromePath: string | undefined;
@@ -56,6 +58,7 @@ function parseArgs(argv: string[]): Args {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--no-images') noImages = true;
+    else if (a === '--paste-html') pasteHtml = true;
     else if (a === '--port') port = Number(argv[++i]);
     else if (a === '--profile') profileDir = argv[++i];
     else if (a === '--chrome') chromePath = argv[++i];
@@ -68,7 +71,7 @@ function parseArgs(argv: string[]): Args {
     console.error('Usage: bun publish.ts <article.md> [--no-images] [--port 9222] [--profile <dir>] [--chrome <path>]');
     process.exit(1);
   }
-  return { mdPath: positional[0], noImages, port, profileDir, chromePath };
+  return { mdPath: positional[0], noImages, pasteHtml, port, profileDir, chromePath };
 }
 
 // ---------------------------------------------------------------------------
@@ -583,6 +586,159 @@ async function ensureDraftId(client: CdpClient, draftId: string | null): Promise
       `draft id 变化: 期望 ${draftId},实际 ${cur}(X 自动保存重载后重定向到了别的草稿)。已中止以防章节错位,请重跑。`,
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// HTML paste assembly (--paste-html) — the merge-safe fast path (2026-11-04).
+//
+// 根因复盘: 逐块 insertText 的打字会话长达 20-30 分钟,期间 X 编辑器与服务器
+// 持续自动保存/恢复,多次把「上个会话的未保存内容」恢复进新草稿或中途合并,
+// 造成两份文章叠写、块序交错、token 凭空消失。治本: 把整个正文构造成带
+// <h1>/<ol>/<ul>/<strong> 的 HTML 写入剪贴板,按章节分块 Ctrl+V 粘贴——
+// DraftJS 原生转换粘贴的富文本,全会话从 30 分钟缩到 ~2 分钟,合并窗口消失。
+// ---------------------------------------------------------------------------
+
+function runsHtml(runs: InlineRun[]): string {
+  let out = '';
+  for (const r of runs) {
+    let t = escapeHtml(r.text);
+    if (r.bold) t = `<strong>${t}</strong>`;
+    if (r.italic) t = `<em>${t}</em>`;
+    out += t;
+  }
+  return out;
+}
+
+function blocksToHtml(blocks: Block[]): string {
+  const parts: string[] = [];
+  let listBuf: Extract<Block, { kind: 'listitem' }>[] = [];
+  const flushList = () => {
+    if (!listBuf.length) return;
+    const tag = listBuf[0]!.ordered ? 'ol' : 'ul';
+    parts.push(
+      `<${tag}>` + listBuf.map((b) => `<li>${runsHtml(b.runs)}</li>`).join('') + `</${tag}>`,
+    );
+    listBuf = [];
+  };
+  for (const b of blocks) {
+    switch (b.kind) {
+      case 'listitem':
+        listBuf.push(b);
+        break;
+      case 'heading': {
+        flushList();
+        const t = b.level <= 2 ? 1 : 2;
+        parts.push(`<h${t}>${escapeHtml(b.text)}</h${t}>`);
+        break;
+      }
+      case 'quote':
+        flushList();
+        parts.push(`<blockquote>${runsHtml(b.runs)}</blockquote>`);
+        break;
+      case 'paragraph':
+        flushList();
+        parts.push(`<p>${runsHtml(b.runs)}</p>`);
+        break;
+      case 'hr':
+      case 'image':
+      case 'table':
+        flushList();
+        parts.push(`<p>${escapeHtml(b.token)}</p>`);
+        break;
+      case 'code':
+        flushList();
+        parts.push(`<pre><code>${escapeHtml(b.text)}</code></pre>`);
+        break;
+    }
+  }
+  flushList();
+  return parts.join('');
+}
+
+/** 按 H1 分块(标题跟随其后的小节),控制单次粘贴体积。 */
+function chunkBlocks(blocks: Block[]): Block[][] {
+  const chunks: Block[][] = [];
+  let cur: Block[] = [];
+  for (const b of blocks) {
+    if (b.kind === 'heading' && cur.length) {
+      chunks.push(cur);
+      cur = [b];
+    } else {
+      cur.push(b);
+    }
+  }
+  if (cur.length) chunks.push(cur);
+  return chunks;
+}
+
+async function pasteArticleHtml(
+  browser: import('./cdp.ts').CdpBrowser,
+  client: CdpClient,
+  blocks: Block[],
+  selectors: Selectors,
+  profileMarker: string,
+  draftId: string | null,
+): Promise<void> {
+  const chunks = chunkBlocks(blocks);
+  console.log(`\n=== pasteArticleHtml (${chunks.length} chunks, rich-HTML clipboard) ===`);
+  await browser
+    .send('Browser.grantPermissions', {
+      permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'],
+    })
+    .catch(() => {});
+
+  const countBlocks = (): Promise<number> =>
+    client.eval<number>(
+      `document.querySelectorAll(${JSON.stringify(selectors.composer)} [data-block="true"]).length`,
+    );
+
+  for (let i = 0; i < chunks.length; i++) {
+    await ensureDraftId(client, draftId);
+    const chunk = chunks[i]!;
+    const html = blocksToHtml(chunk);
+    const plain = chunk
+      .map((b) =>
+        b.kind === 'paragraph' || b.kind === 'heading' || b.kind === 'quote' || b.kind === 'listitem'
+          ? (b as { text: string }).text
+          : ((b as { token?: string }).token ?? ''),
+      )
+      .join('\n');
+
+    const res = await client.send<{ result: { value?: unknown } }>('Runtime.evaluate', {
+      expression: `(async () => {
+        try {
+          const item = new ClipboardItem({
+            'text/html': new Blob([${JSON.stringify(html)},], { type: 'text/html' }),
+            'text/plain': new Blob([${JSON.stringify(plain)},], { type: 'text/plain' }),
+          });
+          await navigator.clipboard.write([item]);
+          return 'OK';
+        } catch (e) { return 'ERR:' + ((e && e.message) || e); }
+      })()`,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    const clip = res?.result?.value;
+    if (clip !== 'OK') {
+      throw new Error(`pasteArticleHtml: 剪贴板写入失败 (chunk ${i + 1}): ${clip}`);
+    }
+
+    await client.bringToFront();
+    await sleep(250);
+    if (i === 0) {
+      await focusComposerEnd(client, selectors);
+      await sleep(350);
+    }
+    const before = await countBlocks();
+    await sendKeys('^v', profileMarker);
+    await sleep(1500);
+    const after = await countBlocks();
+    if (after <= before) {
+      throw new Error(`pasteArticleHtml: chunk ${i + 1} 粘贴后块数未增长 (${before} → ${after})`);
+    }
+    console.log(`  chunk ${i + 1}/${chunks.length} → blocks ${before} → ${after}`);
+  }
+  await snapshot(client, selectors, 'pasteArticleHtml:after');
 }
 
 async function fillBody(
@@ -1758,8 +1914,32 @@ async function main() {
     // 把页面重定向回「最近草稿」造成章节错位(2026-11-04 事故根因)。
     const draftId = await client.eval<string | null>(DRAFT_ID_EXPR).catch(() => null);
     console.log(`[draftId] ${draftId ?? '(unknown)'}`);
+    // 新鲜草稿守卫: X 会把上个会话的未保存内容恢复进「新建」的草稿
+    // (2026-11-04 双份文章叠写事故)。装配开始前草稿必须接近空白。
+    const prefill = await client
+      .eval<number>(
+        `((document.querySelector(${JSON.stringify(selectors.composer)})?.innerText || '').trim()).length`,
+      )
+      .catch(() => -1);
+    if (prefill < 0) throw new Error('createDraft 后找不到 composer');
+    if (prefill > 20) {
+      throw new Error(
+        `新草稿非空(${prefill} 字符)——X 恢复了上个会话的未保存内容。已中止;请先在编辑器里清空该恢复内容(或删除该草稿)再重跑。`,
+      );
+    }
     await fillTitle(client, article.title, selectors);
-    await fillBody(client, article.blocks, selectors, path.basename(args.profileDir), draftId);
+    if (args.pasteHtml) {
+      await pasteArticleHtml(
+        browser,
+        client,
+        article.blocks,
+        selectors,
+        path.basename(args.profileDir),
+        draftId,
+      );
+    } else {
+      await fillBody(client, article.blocks, selectors, path.basename(args.profileDir), draftId);
+    }
     if (codeBlocks.length) {
       await insertCodeBlocks(client, codeBlocks, selectors, path.basename(args.profileDir));
     }
@@ -1770,7 +1950,9 @@ async function main() {
       await insertHrBlocks(client, hrBlocks, selectors, path.basename(args.profileDir), draftId);
     }
     // Headings + quotes + list items: style the token blocks, then swap in real text.
-    await applyBlockStyles(client, article.blocks, selectors, draftId);
+    if (!args.pasteHtml) {
+      await applyBlockStyles(client, article.blocks, selectors, draftId);
+    }
     if (imageBlocks.length && !args.noImages) {
       await insertImages(client, imageBlocks, selectors, path.basename(args.profileDir), draftId);
     } else if (imageBlocks.length) {
