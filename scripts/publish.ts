@@ -567,11 +567,30 @@ async function focusComposerEnd(client: CdpClient, selectors: Selectors): Promis
   if (rect?.ok) await client.clickAt(rect.x, rect.y);
 }
 
+const DRAFT_ID_EXPR =
+  '(()=>{const m=location.href.match(/\\/compose\\/articles\\/edit\\/(\\d+)/);return m?m[1]:null})()';
+
+/**
+ * Draft-ID continuity check. 真凶(2026-11-04 两次章节错位): X 在自动保存触发的
+ * 重载后会把 /compose/articles 重定向回「最近的草稿」,装配流被打进旧草稿,新旧
+ * 内容叠成交错章节。任何阶段发现当前 draft id 与创建时不一致,立即响亮中止。
+ */
+async function ensureDraftId(client: CdpClient, draftId: string | null): Promise<void> {
+  if (!draftId) return;
+  const cur = await client.eval<string>(DRAFT_ID_EXPR).catch(() => 'eval-failed');
+  if (cur !== draftId) {
+    throw new Error(
+      `draft id 变化: 期望 ${draftId},实际 ${cur}(X 自动保存重载后重定向到了别的草稿)。已中止以防章节错位,请重跑。`,
+    );
+  }
+}
+
 async function fillBody(
   client: CdpClient,
   blocks: Block[],
   selectors: Selectors,
   profileMarker: string,
+  draftId: string | null,
 ): Promise<void> {
   const paras = blocks.filter((b) => b.kind === 'paragraph').length;
   const imgs = blocks.filter((b) => b.kind === 'image').length;
@@ -606,14 +625,23 @@ async function fillBody(
         : b.token;
     await client.insertText(content);
     // Dead-page guard (2026-11-04 章节错位事故): 编辑器中途自动保存/重载后继续
-    // 打字,内容会落在过期光标上,把整章正文平移到错误位置。每块检查编辑器存活,
-    // 每 10 块抽查最近一块文本确实落在草稿里——有疑点立即中止,绝不带病续打。
-    const alive = await client
-      .eval<boolean>(`!!document.querySelector(${JSON.stringify(selectors.composer)})`)
-      .catch(() => false);
-    if (!alive) {
+    // 打字,内容会落在过期光标上,把整章正文平移到错误位置。每块检查编辑器存活
+    // + 草稿 id 未被重定向;每 10 块抽查最近一块文本确实落在草稿里。
+    const st = await client
+      .eval<{ alive: boolean; id: string | null }>(
+        `(()=>({alive:!!document.querySelector(${JSON.stringify(
+          selectors.composer,
+        )}),id:${DRAFT_ID_EXPR}}))()`,
+      )
+      .catch(() => ({ alive: false, id: null }));
+    if (!st.alive) {
       throw new Error(
         `fillBody: composer 于第 ${i + 1}/${blocks.length} 块消失(编辑器重载)。已中止以防内容错位,请重跑。`,
+      );
+    }
+    if (draftId && st.id !== draftId) {
+      throw new Error(
+        `fillBody: 第 ${i + 1} 块时 draft id 变为 ${st.id}(期望 ${draftId},X 重定向到了别的草稿)。已中止以防章节错位,请重跑。`,
       );
     }
     if (i % 10 === 9) {
@@ -875,6 +903,7 @@ async function applyBlockStyles(
   client: CdpClient,
   blocks: Block[],
   selectors: Selectors,
+  draftId: string | null,
 ): Promise<void> {
   type StyleTarget = Extract<Block, { kind: 'heading' | 'listitem' | 'quote' }>;
   const targets = blocks.filter(
@@ -885,6 +914,7 @@ async function applyBlockStyles(
   let ok = 0;
   for (let i = 0; i < targets.length; i++) {
     const b = targets[i]!;
+    await ensureDraftId(client, draftId);
     const label = b.kind === 'heading' ? (b.level <= 2 ? '标题' : '副标题') : null;
     console.log(`- [${i + 1}] ${b.kind}${b.kind === 'heading' ? b.level : b.kind === 'quote' ? '(quote)' : b.ordered ? '(ol)' : '(ul)'}: ${b.text.slice(0, 30)}`);
 
@@ -1228,12 +1258,14 @@ async function insertHrBlocks(
   hrBlocks: Block[],
   selectors: Selectors,
   profileMarker: string,
+  draftId: string | null,
 ): Promise<void> {
   if (!hrBlocks.length) return;
   console.log(`\n=== insertHrBlocks (${hrBlocks.length}, 插入→分割线) ===`);
   let ok = 0;
   for (let i = 0; i < hrBlocks.length; i++) {
     const hb = hrBlocks[i] as Extract<Block, { kind: 'hr' }>;
+    await ensureDraftId(client, draftId);
     console.log(`- token[${i + 1}] ${hb.token}`);
 
     const countHrs = async (): Promise<number> =>
@@ -1373,11 +1405,13 @@ async function insertImages(
   imageBlocks: Block[],
   selectors: Selectors,
   profileMarker: string,
+  draftId: string | null,
 ): Promise<void> {
   console.log(`\n=== insertImages (${imageBlocks.length}, paste-replace tokens) ===`);
   let ok = 0;
   for (let i = 0; i < imageBlocks.length; i++) {
     const im = imageBlocks[i] as Extract<Block, { kind: 'image' }>;
+    await ensureDraftId(client, draftId);
     const before = await countImgs(client, selectors);
     console.log(`- token[${i + 1}] ${im.token} ← ${path.basename(im.path)}`);
 
@@ -1720,8 +1754,12 @@ async function main() {
     );
 
     await createDraft(client, selectors);
+    // 记录本run的草稿 id——后续所有阶段用它核对,防止 X 自动保存重载后
+    // 把页面重定向回「最近草稿」造成章节错位(2026-11-04 事故根因)。
+    const draftId = await client.eval<string | null>(DRAFT_ID_EXPR).catch(() => null);
+    console.log(`[draftId] ${draftId ?? '(unknown)'}`);
     await fillTitle(client, article.title, selectors);
-    await fillBody(client, article.blocks, selectors, path.basename(args.profileDir));
+    await fillBody(client, article.blocks, selectors, path.basename(args.profileDir), draftId);
     if (codeBlocks.length) {
       await insertCodeBlocks(client, codeBlocks, selectors, path.basename(args.profileDir));
     }
@@ -1729,12 +1767,12 @@ async function main() {
       (b): b is Block & { kind: 'hr' } => b.kind === 'hr',
     );
     if (hrBlocks.length) {
-      await insertHrBlocks(client, hrBlocks, selectors, path.basename(args.profileDir));
+      await insertHrBlocks(client, hrBlocks, selectors, path.basename(args.profileDir), draftId);
     }
     // Headings + quotes + list items: style the token blocks, then swap in real text.
-    await applyBlockStyles(client, article.blocks, selectors);
+    await applyBlockStyles(client, article.blocks, selectors, draftId);
     if (imageBlocks.length && !args.noImages) {
-      await insertImages(client, imageBlocks, selectors, path.basename(args.profileDir));
+      await insertImages(client, imageBlocks, selectors, path.basename(args.profileDir), draftId);
     } else if (imageBlocks.length) {
       console.log('\n[--no-images] tokens left in body; run pw-images.ts to insert them.');
     }

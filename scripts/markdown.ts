@@ -126,7 +126,8 @@ export function parseRuns(raw: string): InlineRun[] {
   };
   while ((m = re.exec(raw))) {
     if (m.index > last) push({ text: raw.slice(last, m.index) });
-    if (m[1] !== undefined) push({ text: m[1], url: m[2] });
+    // 2026-11-04(用户确认): 链接不做隐藏式超链接,直接把网址以明文放进文本。
+    if (m[1] !== undefined) push({ text: `${m[1]} ${m[2]}` });
     else if (m[3] !== undefined) push({ text: m[3], bold: true });
     else if (m[4] !== undefined) push({ text: m[4], code: true });
     else if (m[5] !== undefined) push({ text: m[5], italic: true });
@@ -174,9 +175,8 @@ function parseFrontmatter(src: string): {
 function stripInline(text: string): string {
   return text
     .replace(/^#{1,6}\s+/, '') // ATX heading markers → plain text paragraph
-    // 2026-11-04: 列表条目/标题里的 [text](url) 剥成纯文本——管线只给段落上链接
-    // 样式,不剥的话 200+ 条裸 Markdown 语法会原样发布出去。
-    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '$1')
+    // 2026-11-04: 列表条目/标题里的 [text](url) 转成「text url」明文,不留裸 Markdown 语法。
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '$1 $2')
     .replace(/\*\*(.+?)\*\*/g, '$1')
     .replace(/(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)/g, '$1')
     .replace(/__(.+?)__/g, '$1')
