@@ -42,6 +42,7 @@ type Args = {
   mdPath: string;
   noImages: boolean;
   pasteHtml: boolean;
+  finishOnly: boolean;
   port: number;
   profileDir: string;
   chromePath?: string;
@@ -51,6 +52,7 @@ function parseArgs(argv: string[]): Args {
   const positional: string[] = [];
   let noImages = false;
   let pasteHtml = false;
+  let finishOnly = false;
   let port = 9222;
   let profileDir = path.join(os.homedir(), '.local', 'share', 'x-browser-profile');
   let chromePath: string | undefined;
@@ -59,6 +61,7 @@ function parseArgs(argv: string[]): Args {
     const a = argv[i];
     if (a === '--no-images') noImages = true;
     else if (a === '--paste-html') pasteHtml = true;
+    else if (a === '--finish-only') finishOnly = true;
     else if (a === '--port') port = Number(argv[++i]);
     else if (a === '--profile') profileDir = argv[++i];
     else if (a === '--chrome') chromePath = argv[++i];
@@ -689,7 +692,7 @@ async function pasteArticleHtml(
 
   const countBlocks = (): Promise<number> =>
     client.eval<number>(
-      `document.querySelectorAll(${JSON.stringify(selectors.composer)} [data-block="true"]).length`,
+      `document.querySelectorAll('[data-testid="composer"] [data-block="true"]').length`,
     );
 
   for (let i = 0; i < chunks.length; i++) {
