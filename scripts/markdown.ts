@@ -57,7 +57,7 @@ export type Block =
   | { kind: 'paragraph'; text: string; runs: InlineRun[] }
   | { kind: 'heading'; level: number; text: string; token: string }
   | { kind: 'quote'; text: string; runs: InlineRun[]; token: string }
-  | { kind: 'listitem'; ordered: boolean; text: string; token: string }
+  | { kind: 'listitem'; ordered: boolean; text: string; runs: InlineRun[]; token: string }
   | { kind: 'hr'; token: string }
   | { kind: 'table'; rows: string[][]; raw: string[]; token: string }
   | { kind: 'image'; path: string; raw: string; token: string }
@@ -510,10 +510,14 @@ export function parseArticle(mdPath: string): ParsedArticle {
     if (li) {
       flushInline();
       listCount++;
+      // 2026-11-04(用户确认:列表条目的链接必须保留): parseRuns 解析条目,
+      // 显示文本去掉 Markdown 标记,链接/加粗 run 由 applyBlockStyles 上样式。
+      const liRuns = parseRuns(li[3] ?? '');
       blocks.push({
         kind: 'listitem',
         ordered: li[2] !== undefined,
-        text: stripInline(li[3] ?? ''),
+        text: liRuns.map((r) => r.text).join(''),
+        runs: liRuns,
         token: listToken(listCount),
       });
       continue;

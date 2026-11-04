@@ -955,6 +955,12 @@ async function applyBlockStyles(
       await applyInlineRuns(client, { text: b.text, runs: b.runs }, selectors);
     }
 
+    // 3.6 listitem: 同 quote,给条目自己的链接/加粗上样式
+    // (2026-11-04 用户确认:列表条目的链接必须保留为真链接)。
+    if (b.kind === 'listitem' && b.runs.some((r) => r.bold || r.italic || r.url)) {
+      await applyInlineRuns(client, { text: b.text, runs: b.runs }, selectors);
+    }
+
     // 4. verify: token gone + block class changed from unstyled
     const state = await client.eval<{ gone: boolean; cls: string }>(`(() => {
       const c = document.querySelector(${JSON.stringify(selectors.composer)});
@@ -1259,6 +1265,21 @@ async function insertHrBlocks(
         } catch (e) { return 'ERR:' + e.message; } })()`,
       );
       if (prep !== 'OK') {
+        if (i === 0 && attempt === 0) {
+          const diag = await client
+            .eval<string>(
+              `(() => { const c = document.querySelector(${JSON.stringify(selectors.composer)});
+                 const blocks = c ? [...c.querySelectorAll(${JSON.stringify(selectors.block)})] : [];
+                 return JSON.stringify({
+                   tokenTextInComposer: (c?.innerText || '').includes('XAP-HR-'),
+                   blocks: blocks.length,
+                   empties: blocks.filter(b => (b.innerText || '').trim() === '').length,
+                   hrs: c ? c.querySelectorAll('hr').length : -1,
+                 }); })()`,
+            )
+            .catch(() => 'diag-failed');
+          console.warn(`  ! hr 诊断: ${diag}`);
+        }
         console.warn(`  ! caret prep failed (${prep}, attempt ${attempt + 1})`);
         continue;
       }

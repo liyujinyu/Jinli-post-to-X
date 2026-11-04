@@ -223,8 +223,8 @@ export async function auditDraft(
 
   // 5. 链接
   const wantUrls = new Set<string>();
-  for (const b of article.blocks) if (b.kind === 'paragraph') {
-    for (const r of b.runs) if (r.url) wantUrls.add(r.url);
+  for (const b of article.blocks) if (b.kind === 'paragraph' || b.kind === 'quote' || b.kind === 'listitem') {
+    for (const r of ((b as any).runs ?? []) as any[]) if (r && r.url) wantUrls.add(r.url);
   }
   const missing = [...wantUrls].filter(u => !dom.anchors.some(a => a === u || (a || '').includes(u)));
   add('链接', missing.length === 0,
