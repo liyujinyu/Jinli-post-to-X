@@ -704,22 +704,29 @@ async function pasteArticleHtml(
       )
       .join('\n');
 
-    const res = await client.send<{ result: { value?: unknown } }>('Runtime.evaluate', {
-      expression: `(async () => {
-        try {
-          const item = new ClipboardItem({
-            'text/html': new Blob([${JSON.stringify(html)},], { type: 'text/html' }),
-            'text/plain': new Blob([${JSON.stringify(plain)},], { type: 'text/plain' }),
-          });
-          await navigator.clipboard.write([item]);
-          return 'OK';
-        } catch (e) { return 'ERR:' + ((e && e.message) || e); }
-      })()`,
-      awaitPromise: true,
-      returnByValue: true,
-    });
-    const clip = res?.result?.value;
-    if (clip !== 'OK') {
+    let clip: unknown = 'NOT-TRIED';
+    for (let t = 0; t < 3 && !String(clip).startsWith('OK'); t++) {
+      await client.bringToFront();
+      await sleep(600);
+      const res = await client.send<{ result: { value?: unknown } }>('Runtime.evaluate', {
+        expression: `(async () => {
+          try {
+            if (!document.hasFocus()) return 'NOT-FOCUSED';
+            const item = new ClipboardItem({
+              'text/html': new Blob([${JSON.stringify(html)},], { type: 'text/html' }),
+              'text/plain': new Blob([${JSON.stringify(plain)},], { type: 'text/plain' }),
+            });
+            await navigator.clipboard.write([item]);
+            return 'OK';
+          } catch (e) { return 'ERR:' + ((e && e.message) || e); }
+        })()`,
+        awaitPromise: true,
+        returnByValue: true,
+      });
+      clip = res?.result?.value;
+      console.log(`  clipboard(chunk ${i + 1}, try ${t + 1}): ${clip}`);
+    }
+    if (!String(clip).startsWith('OK')) {
       throw new Error(`pasteArticleHtml: 剪贴板写入失败 (chunk ${i + 1}): ${clip}`);
     }
 
