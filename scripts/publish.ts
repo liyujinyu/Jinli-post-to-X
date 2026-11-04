@@ -605,6 +605,32 @@ async function fillBody(
           : b.token
         : b.token;
     await client.insertText(content);
+    // Dead-page guard (2026-11-04 章节错位事故): 编辑器中途自动保存/重载后继续
+    // 打字,内容会落在过期光标上,把整章正文平移到错误位置。每块检查编辑器存活,
+    // 每 10 块抽查最近一块文本确实落在草稿里——有疑点立即中止,绝不带病续打。
+    const alive = await client
+      .eval<boolean>(`!!document.querySelector(${JSON.stringify(selectors.composer)})`)
+      .catch(() => false);
+    if (!alive) {
+      throw new Error(
+        `fillBody: composer 于第 ${i + 1}/${blocks.length} 块消失(编辑器重载)。已中止以防内容错位,请重跑。`,
+      );
+    }
+    if (i % 10 === 9) {
+      const probe = content.replace(/\s+/g, ' ').trim().slice(-25);
+      if (probe) {
+        const present = await client
+          .eval<boolean>(
+            `((document.querySelector(${JSON.stringify(selectors.composer)})?.innerText || '').replace(/\\s+/g, ' ')).includes(${JSON.stringify(probe)})`,
+          )
+          .catch(() => false);
+        if (!present) {
+          throw new Error(
+            `fillBody: 第 ${i + 1} 块文本未落在草稿中(草稿可能被旧版自动保存覆盖)。已中止以防章节错位,请重跑。`,
+          );
+        }
+      }
+    }
     await sleep(120);
     if (b.kind === 'paragraph') await applyInlineRuns(client, b, selectors);
     // NEVER press Enter / type the next block while a selection is held —

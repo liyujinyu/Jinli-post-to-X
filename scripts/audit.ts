@@ -186,10 +186,15 @@ export async function auditDraft(
     add(`数量 ${k}`, e === a, `期望 ${e} / 实际 ${a}`);
   }
 
-  // 4. 顺序逐项比对 + 文本抽查
-  if (expected.length === actual.length) {
+  // 4. 顺序逐项比对 + 文本抽查。块数不一致(如 HR/引用缺失)时绝不静默跳过——
+  //    恰恰是这种时刻最需要顺序校验(2026-11-04 章节错位事故的盲区)。
+  {
+    const len = Math.min(expected.length, actual.length);
+    if (expected.length !== actual.length) {
+      add('块数', false, `期望 ${expected.length} / 实际 ${actual.length},顺序比对按前 ${len} 块进行`);
+    }
     let mismatches = 0;
-    for (let i = 0; i < expected.length; i++) {
+    for (let i = 0; i < len; i++) {
       if (expected[i] !== actual[i]) {
         mismatches++;
         if (mismatches <= 5) {
@@ -203,7 +208,7 @@ export async function auditDraft(
 
     // 文本抽查:段落/标题/列表首 12 个归一化字符
     let textBad = 0;
-    for (let i = 0; i < article.blocks.length; i++) {
+    for (let i = 0; i < len; i++) {
       const b = article.blocks[i];
       if (b.kind === 'image' || b.kind === 'code' || b.kind === 'table' || b.kind === 'hr') continue;
       const want = normalize(b.text);

@@ -174,6 +174,9 @@ function parseFrontmatter(src: string): {
 function stripInline(text: string): string {
   return text
     .replace(/^#{1,6}\s+/, '') // ATX heading markers → plain text paragraph
+    // 2026-11-04: 列表条目/标题里的 [text](url) 剥成纯文本——管线只给段落上链接
+    // 样式,不剥的话 200+ 条裸 Markdown 语法会原样发布出去。
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '$1')
     .replace(/\*\*(.+?)\*\*/g, '$1')
     .replace(/(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)/g, '$1')
     .replace(/__(.+?)__/g, '$1')
