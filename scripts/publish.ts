@@ -704,42 +704,69 @@ async function pasteArticleHtml(
       )
       .join('\n');
 
-    let clip: unknown = 'NOT-TRIED';
-    for (let t = 0; t < 3 && !String(clip).startsWith('OK'); t++) {
+    const before = await countBlocks();
+
+    // 主路径: 页面内合成 paste 事件——已验证 DraftJS 完整转换 H1/H2/OL/UL/Q/
+    // 加粗(内联 w=700),且不依赖 OS 窗口焦点(2026-11-04 SetForegroundWindow 败点)。
+    const disp = await client.send<{ result: { value?: unknown } }>('Runtime.evaluate', {
+      expression: `(async () => {
+        try {
+          const c = document.querySelector(${JSON.stringify(selectors.composer)});
+          const ce = c && (c.querySelector('[contenteditable="true"]') || c);
+          if (!ce) return 'NO-EDITOR';
+          ce.focus();
+          const dt = new DataTransfer();
+          dt.setData('text/html', ${JSON.stringify(html)});
+          const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+          ce.dispatchEvent(ev);
+          return 'DISPATCHED';
+        } catch (e) { return 'ERR:' + ((e && e.message) || e); }
+      })()`,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    await sleep(1500);
+    let after = await countBlocks();
+
+    if (after <= before) {
+      // 后备: OS 剪贴板 + 真实 Ctrl+V(需要 Chrome 窗口在前台)。
+      console.warn(`  ! 合成粘贴未生效(${disp?.result?.value}),退回 OS 粘贴`);
+      let clip: unknown = 'NOT-TRIED';
+      for (let t = 0; t < 3 && !String(clip).startsWith('OK'); t++) {
+        await client.bringToFront();
+        await sleep(600);
+        const res = await client.send<{ result: { value?: unknown } }>('Runtime.evaluate', {
+          expression: `(async () => {
+            try {
+              if (!document.hasFocus()) return 'NOT-FOCUSED';
+              const item = new ClipboardItem({
+                'text/html': new Blob([${JSON.stringify(html)},], { type: 'text/html' }),
+                'text/plain': new Blob([${JSON.stringify(plain)},], { type: 'text/plain' }),
+              });
+              await navigator.clipboard.write([item]);
+              return 'OK';
+            } catch (e) { return 'ERR:' + ((e && e.message) || e); }
+          })()`,
+          awaitPromise: true,
+          returnByValue: true,
+        });
+        clip = res?.result?.value;
+        console.log(`  clipboard(chunk ${i + 1}, try ${t + 1}): ${clip}`);
+      }
+      if (!String(clip).startsWith('OK')) {
+        throw new Error(`pasteArticleHtml: 剪贴板写入失败 (chunk ${i + 1}): ${clip}`);
+      }
       await client.bringToFront();
-      await sleep(600);
-      const res = await client.send<{ result: { value?: unknown } }>('Runtime.evaluate', {
-        expression: `(async () => {
-          try {
-            if (!document.hasFocus()) return 'NOT-FOCUSED';
-            const item = new ClipboardItem({
-              'text/html': new Blob([${JSON.stringify(html)},], { type: 'text/html' }),
-              'text/plain': new Blob([${JSON.stringify(plain)},], { type: 'text/plain' }),
-            });
-            await navigator.clipboard.write([item]);
-            return 'OK';
-          } catch (e) { return 'ERR:' + ((e && e.message) || e); }
-        })()`,
-        awaitPromise: true,
-        returnByValue: true,
-      });
-      clip = res?.result?.value;
-      console.log(`  clipboard(chunk ${i + 1}, try ${t + 1}): ${clip}`);
-    }
-    if (!String(clip).startsWith('OK')) {
-      throw new Error(`pasteArticleHtml: 剪贴板写入失败 (chunk ${i + 1}): ${clip}`);
+      await sleep(250);
+      if (i === 0) {
+        await focusComposerEnd(client, selectors);
+        await sleep(350);
+      }
+      await sendKeys('^v', profileMarker);
+      await sleep(1500);
+      after = await countBlocks();
     }
 
-    await client.bringToFront();
-    await sleep(250);
-    if (i === 0) {
-      await focusComposerEnd(client, selectors);
-      await sleep(350);
-    }
-    const before = await countBlocks();
-    await sendKeys('^v', profileMarker);
-    await sleep(1500);
-    const after = await countBlocks();
     if (after <= before) {
       throw new Error(`pasteArticleHtml: chunk ${i + 1} 粘贴后块数未增长 (${before} → ${after})`);
     }
