@@ -73,6 +73,8 @@ bun "${SKILL_DIR}/scripts/audit.ts" "创作输出/我的长文.md" 2096095610722
 |------|------|------|
 | `<md>` | (必填)| 文章 markdown 路径 |
 | `--no-images` | 关 | 只填文字+封面,跳过正文配图 |
+| `--legacy-inline` | 关 | 改用旧的逐块打字/工具栏管线;默认使用更快、更稳定的富文本 HTML 粘贴 |
+| `--finish-only` | 关 | 仅恢复当前已有草稿的代码块/分隔线/图片/封面/审计收尾 |
 | `--port` | `9222` | Chrome 调试端口 |
 | `--profile <dir>` | `~/.local/share/x-browser-profile` | Chrome user-data-dir(存登录态)|
 | `--chrome <path>` | 自动探测 | 指定 chrome 可执行文件 |

@@ -46,6 +46,8 @@ bun <skill路径>/scripts/publish.ts "你的文章.md" --port 9222
 |------|------|------|
 | `<md>` | 必填 | 文章 markdown |
 | `--no-images` | 关 | 只填文字+封面,跳过正文配图 |
+| `--legacy-inline` | 关 | 改用旧的逐块打字/工具栏管线;默认使用富文本 HTML 粘贴 |
+| `--finish-only` | 关 | 对当前已有草稿仅执行收尾和审计 |
 | `--port` | `9222` | Chrome 调试端口 |
 | `--profile <dir>` | `~/.local/share/x-browser-profile` | Chrome profile(存登录态) |
 | `--chrome <path>` | 自动探测 | chrome.exe 路径 |

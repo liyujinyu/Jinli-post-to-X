@@ -39,6 +39,8 @@ cover_image: attachments/cover.png   # 可选；不写则正文第一张图自�
 |------|------|------|
 | `<md>` | （必填）| 文章 markdown 路径 |
 | `--no-images` | 关 | 只填文字+封面，跳过正文配图 |
+| `--legacy-inline` | 关 | 改用旧的逐块打字/工具栏管线;默认使用富文本 HTML 粘贴 |
+| `--finish-only` | 关 | 仅恢复当前已有草稿的收尾步骤与审计 |
 | `--port` | `9222` | Chrome 调试端口 |
 | `--profile <dir>` | `~/.local/share/x-browser-profile` | Chrome user-data-dir（存登录态）|
 | `--chrome <path>` | 自动探测 | 指定 chrome 可执行文件 |
