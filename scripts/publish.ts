@@ -686,7 +686,16 @@ async function pasteArticleHtml(
   draftId: string | null,
 ): Promise<void> {
   const chunks = chunkBlocks(blocks);
-  console.log(`\n=== pasteArticleHtml (${chunks.length} chunks, rich-HTML clipboard) ===`);
+  // 整篇单次粘贴优先: 分块粘贴时,以 <h1> 开头的块首元素会被并进前一块段落,
+  // 标题整体丢失(2026-11-05 V4 事故)。空编辑器 + 单次粘贴是迷你验证过的场景。
+  const whole = blocksToHtml(blocks);
+  if (whole.length < 200_000) {
+    chunks.length = 0;
+    chunks.push(blocks.slice());
+    console.log(`\n=== pasteArticleHtml (single paste, ${whole.length} chars html) ===`);
+  } else {
+    console.log(`\n=== pasteArticleHtml (${chunks.length} chunks, rich-HTML clipboard) ===`);
+  }
   await browser
     .send('Browser.grantPermissions', {
       permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'],
