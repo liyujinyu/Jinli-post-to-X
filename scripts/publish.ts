@@ -1753,7 +1753,10 @@ async function convertTablesToImages(
   if (!tables.length) return;
   console.log(`\n=== convertTablesToImages (${tables.length} tables → PNG) ===`);
 
-  let imgTotal = article.blocks.filter((b) => b.kind === 'image').length;
+  let imgTotal = article.blocks.filter((b) => b.kind === 'image').reduce((max, b) => {
+    const m = (b as { token?: string }).token?.match(/XAP-IMG-(\d+)-/);
+    return Math.max(max, m ? Number(m[1]) : 0);
+  }, 0);
 
   for (let n = 0; n < tables.length; n++) {
     const { b, i } = tables[n]!;
