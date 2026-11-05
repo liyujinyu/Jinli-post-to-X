@@ -1990,6 +1990,10 @@ async function main() {
   const { browser, client } = await connect(args.port, {
     tabUrl: /x\.com/,
     openUrl: 'https://x.com/compose/articles',
+    // Navigating an already-mounted DraftJS editor to a second new article can
+    // leave X's React route as a blank shell. A fresh target avoids that stale
+    // editor state; --finish-only intentionally attaches to the existing tab.
+    newTab: !args.finishOnly,
   });
 
   try {

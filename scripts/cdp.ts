@@ -365,6 +365,8 @@ export type ConnectOptions = {
   tabUrl?: RegExp;
   /** If no matching tab exists, open one at this URL. */
   openUrl?: string;
+  /** Always create a fresh target instead of reusing an existing X editor tab. */
+  newTab?: boolean;
   defaultTimeoutMs?: number;
 };
 
@@ -388,7 +390,7 @@ export async function connect(
   );
 
   let tabs = await getTabs(browser);
-  let tab = tabs.find((t) => tabUrl.test(t.url || ''));
+  let tab = options.newTab ? undefined : tabs.find((t) => tabUrl.test(t.url || ''));
   if (!tab) {
     const { targetId } = await browser.send<{ targetId: string }>(
       'Target.createTarget',
