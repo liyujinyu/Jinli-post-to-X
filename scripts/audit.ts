@@ -66,8 +66,8 @@ function dumpExpr(composer: string): string {
     let lastContent = -1;
     all.forEach((b, i) => {
       let kind = null;
-      if (b.querySelector('img')) kind = 'IMG';
-      else if (b.querySelector('hr')) kind = 'HR';
+       if (b.querySelector('img')) kind = 'IMG';
+       else if (b.querySelector('hr, [role="separator"]')) kind = 'HR';
       else if (b.querySelector('button[aria-label="编辑块"]')) kind = 'CODE';
       else {
         const cls = b.className || '';
@@ -82,11 +82,20 @@ function dumpExpr(composer: string): string {
         out.push({ kind, text: (b.innerText || '').trim().split(NL).join(' ') });
         lastContent = i;
       } else {
-        empties.push({
+         const prevNode = all[i - 1];
+         const nextNode = all[i + 1];
+         const isNativeBlock = (x) => !!(x && x.querySelector(
+           'hr, [role="separator"], button[aria-label="编辑块"], [data-testid="markdown-code-block"]'
+         ));
+         empties.push({
           idx: i,
           prev: out.length
             ? out[out.length - 1].kind + ' “' + out[out.length - 1].text.slice(0, 18) + '”'
             : '(文首)',
+           // DraftJS keeps spacer caret blocks around non-editable native
+           // dividers/code cards. They are editor structure, not leaked token
+           // shells, and cannot be removed without damaging the native block.
+           structural: isNativeBlock(prevNode) || isNativeBlock(nextNode),
         });
       }
     });
@@ -119,7 +128,7 @@ export async function auditDraft(
   let dom: {
     blocks: DomBlock[];
     anchors: string[];
-    empties: { idx: number; prev: string; trailing: boolean }[];
+    empties: { idx: number; prev: string; trailing: boolean; structural?: boolean }[];
   };
   try {
     const parsed = JSON.parse(raw);
@@ -140,15 +149,16 @@ export async function auditDraft(
 
   // 1b. 空行残留:正文中间的空块(如代码卡片上方没删干净的 token 空壳);
   //     结尾留白(trailing)是编辑器常态,放行但计数提示。
-  const stray = (dom.empties || []).filter(e => !e.trailing);
+  const stray = (dom.empties || []).filter(e => !e.trailing && !e.structural);
+  const structural = (dom.empties || []).filter(e => !e.trailing && e.structural).length;
   add(
     '无空行残留',
     stray.length === 0,
     stray.length
       ? `${stray.length} 处: ${stray.map(e => `第 ${e.idx + 1} 块,上方是 ${e.prev}`).join('; ').slice(0, 200)}`
       : (dom.empties || []).length
-        ? `正文无空行(结尾留白 ${(dom.empties || []).length} 块,已忽略)`
-        : '正文无空行',
+        ? `正文无异常空行(原生块结构留白 ${structural} 块,结尾留白 ${(dom.empties || []).filter(e => e.trailing).length} 块,已忽略)`
+        : '正文无异常空行',
   );
 
   // 2. 标题

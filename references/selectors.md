@@ -47,6 +47,7 @@
   // 工具栏引号（blockquote）按钮候选；都 miss 时脚本还会按 aria-label
   // /引用|引用文|blockquote|quote/i 兜底查找
   "quoteButton": [
+    "[data-testid=\"btn-blockquote\"]",
     "[data-testid=\"btn-block-quote\"]",
     "[data-testid=\"btn-quote\"]"
   ],

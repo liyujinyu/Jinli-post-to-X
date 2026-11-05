@@ -109,7 +109,11 @@ const DEFAULT_SELECTORS = {
   publishText: ['发布', 'Publish', '公開', '게시'],
   composerImages: '[data-testid="composer"] img',
   // 工具栏引号（blockquote）按钮候选；aria-label 回退在 clickQuoteButton 里。
-  quoteButton: ['[data-testid="btn-block-quote"]', '[data-testid="btn-quote"]'],
+  quoteButton: [
+    '[data-testid="btn-blockquote"]',
+    '[data-testid="btn-block-quote"]',
+    '[data-testid="btn-quote"]',
+  ],
 };
 
 type Selectors = typeof DEFAULT_SELECTORS;
@@ -452,11 +456,15 @@ async function clickQuoteButton(client: CdpClient, selectors: Selectors): Promis
 // Steps
 // ---------------------------------------------------------------------------
 
-async function createDraft(client: CdpClient, selectors: Selectors): Promise<void> {
+async function createDraft(
+  client: CdpClient,
+  selectors: Selectors,
+  recoverExisting = false,
+): Promise<void> {
   console.log('\n=== createDraft ===');
   const titlePresent = `(()=>{ const sels=${jsList(selectors.titleInput)}; return ${anySelectorExpr(selectors.titleInput)}; })()`;
   const currentUrl = await client.eval<string>('location.href').catch(() => '');
-  if (/\/compose\/articles\/edit\//.test(currentUrl)) {
+  if (recoverExisting && /\/compose\/articles\/edit\//.test(currentUrl)) {
     console.log(`[createDraft] Recovering existing edit page: ${currentUrl}`);
     if (!(await client.waitFor(titlePresent, 15_000).catch(() => false))) {
       await client.navigate(currentUrl);
@@ -519,12 +527,28 @@ async function createDraft(client: CdpClient, selectors: Selectors): Promise<voi
   // Wait for the editor: URL moves to /edit/<id> AND the composer mounts.
   // (Waiting on the title textarea alone produced false negatives — the draft
   // was created but the placeholder-based selector didn't match.)
-  const editorReady = await client.waitFor(
+  let editorReady = await client.waitFor(
     `/compose\\/articles\\/edit\\//.test(location.href) && !!document.querySelector(${JSON.stringify(
       selectors.composer,
     )})`,
-    90_000,
+    25_000,
   );
+  // X sometimes updates the URL to /edit/<id> but leaves the React route as a
+  // nearly empty shell (only the keyboard-shortcut hint is mounted). A direct
+  // reload of the newly-created edit URL reliably mounts the actual editor.
+  if (!editorReady) {
+    const editUrl = await client.eval<string>('location.href').catch(() => '');
+    if (/\/compose\/articles\/edit\//.test(editUrl)) {
+      console.warn('[createDraft] edit URL opened without composer; reloading once…');
+      await client.send('Page.reload', { ignoreCache: true }).catch(async () => {
+        await client.navigate(editUrl);
+      });
+      editorReady = await client.waitFor(
+        `!!document.querySelector(${JSON.stringify(selectors.composer)})`,
+        60_000,
+      ).catch(() => false);
+    }
+  }
   if (!editorReady) {
     const diag = await client.eval<{ url: string; title: string; text: string; dialogs: string[] }>(`(() => ({
       url: location.href,
@@ -1486,9 +1510,10 @@ async function insertHrBlocks(
     await ensureDraftId(client, draftId);
     console.log(`- token[${i + 1}] ${hb.token}`);
 
+    const dividerSelector = `${selectors.composer} [data-block="true"] [role="separator"]`;
     const countHrs = async (): Promise<number> =>
       client.eval<number>(
-        `document.querySelectorAll(${JSON.stringify(selectors.composer)} hr).length`,
+        `document.querySelectorAll(${JSON.stringify(dividerSelector)}).length`,
       );
 
     let done = false;
@@ -1590,12 +1615,13 @@ async function insertHrBlocks(
         await sleep(1300);
       }
 
-      // Verify: token gone AND an <hr> appeared.
+      // Verify: token gone AND a native divider appeared. X now renders native
+      // dividers as [role=separator] inside a non-editable data block (not <hr>).
       const state = await client.eval<{ gone: boolean; hrs: number }>(
         `(() => {
           const c = document.querySelector(${JSON.stringify(selectors.composer)});
           const gone = !(c && (c.innerText || '').includes(${JSON.stringify(hb.token)}));
-          return { gone, hrs: c ? c.querySelectorAll('hr').length : 0 };
+          return { gone, hrs: c ? c.querySelectorAll('[data-block="true"] [role="separator"]').length : 0 };
         })()`,
       );
       if (state?.gone && state.hrs > before) {
@@ -1977,11 +2003,14 @@ async function main() {
     let draftId: string | null = null;
     if (args.finishOnly) {
       // --finish-only: 内容已在草稿里(此前崩溃),只跑收尾阶段(分割线/图/封面/审计)。
-      await createDraft(client, selectors);
+       await createDraft(client, selectors, true);
       draftId = await client.eval<string | null>(DRAFT_ID_EXPR).catch(() => null);
       console.log(`[draftId][finish-only] ${draftId ?? '(unknown)'}`);
     } else {
-      await createDraft(client, selectors);
+       // A normal run always starts a fresh draft. Reusing the currently open
+       // edit URL caused autosaved content from earlier runs to be merged into
+       // the new article. Existing-draft recovery is reserved for --finish-only.
+       await createDraft(client, selectors, false);
       // 记录本run的草稿 id——后续所有阶段用它核对,防止 X 自动保存重载后
       // 把页面重定向回「最近草稿」造成章节错位(2026-11-04 事故根因)。
       draftId = await client.eval<string | null>(DRAFT_ID_EXPR).catch(() => null);
