@@ -126,8 +126,9 @@ export function parseRuns(raw: string): InlineRun[] {
   };
   while ((m = re.exec(raw))) {
     if (m.index > last) push({ text: raw.slice(last, m.index) });
-    // 2026-11-04(用户确认): 链接不做隐藏式超链接,直接把网址以明文放进文本。
-    if (m[1] !== undefined) push({ text: `${m[1]} ${m[2]}` });
+    // 2026-11-05(用户确认): 链接保留为真超链接 run——粘贴管线渲染 <a href> 原生
+    // 转换,不再走逐个链接对话框;打字(legacy)管线仍走对话框。
+    if (m[1] !== undefined) push({ text: m[1], url: m[2] });
     else if (m[3] !== undefined) push({ text: m[3], bold: true });
     else if (m[4] !== undefined) push({ text: m[4], code: true });
     else if (m[5] !== undefined) push({ text: m[5], italic: true });
@@ -175,8 +176,8 @@ function parseFrontmatter(src: string): {
 function stripInline(text: string): string {
   return text
     .replace(/^#{1,6}\s+/, '') // ATX heading markers → plain text paragraph
-    // 2026-11-04: 列表条目/标题里的 [text](url) 转成「text url」明文,不留裸 Markdown 语法。
-    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '$1 $2')
+    // 标题里的 [text](url) 只留文字(标题不放网址,链接属于正文段落)。
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '$1')
     .replace(/\*\*(.+?)\*\*/g, '$1')
     .replace(/(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)/g, '$1')
     .replace(/__(.+?)__/g, '$1')

@@ -605,6 +605,7 @@ function runsHtml(runs: InlineRun[]): string {
   let out = '';
   for (const r of runs) {
     let t = escapeHtml(r.text);
+    if (r.url) t = `<a href="${escapeHtml(r.url)}">${t}</a>`;
     if (r.bold) t = `<strong>${t}</strong>`;
     if (r.italic) t = `<em>${t}</em>`;
     out += t;
@@ -649,8 +650,10 @@ function blocksToHtml(blocks: Block[]): string {
         parts.push(`<p>${escapeHtml(b.token)}</p>`);
         break;
       case 'code':
+        // 代码块留 token 占位,由 insertCodeBlocks 走「插入→代码」生成原生代码卡
+        // (粘贴 <pre> 无法可靠转换成代码卡,2026-11-05)。
         flushList();
-        parts.push(`<pre><code>${escapeHtml(b.text)}</code></pre>`);
+        parts.push(`<p>${escapeHtml(b.token)}</p>`);
         break;
     }
   }
@@ -1967,9 +1970,36 @@ async function main() {
         .catch(() => -1);
       if (prefill < 0) throw new Error('createDraft 后找不到 composer');
       if (prefill > 20) {
-        throw new Error(
-          `新草稿非空(${prefill} 字符)——X 恢复了上个会话的未保存内容。已中止;请先在编辑器里清空该恢复内容(或删除该草稿)再重跑。`,
-        );
+        // 自愈:X 把上个会话内容恢复进了新草稿——execCommand 全选删除后再核验,
+        // 仍清不干净才中止(2026-11-05)。
+        console.warn(`[prefill] 草稿非空(${prefill} 字符),自动清空恢复内容…`);
+        await client
+          .eval(`(() => {
+            const c = document.querySelector(${JSON.stringify(selectors.composer)});
+            const ce = c && (c.querySelector('[contenteditable="true"]') || c);
+            if (!ce) return false;
+            ce.focus();
+            const sel = window.getSelection();
+            const rg = document.createRange();
+            rg.selectNodeContents(ce);
+            sel.removeAllRanges();
+            sel.addRange(rg);
+            document.execCommand('delete');
+            return true;
+          })()`)
+          .catch(() => false);
+        await sleep(1200);
+        const recheck = await client
+          .eval<number>(
+            `((document.querySelector(${JSON.stringify(selectors.composer)})?.innerText || '').trim()).length`,
+          )
+          .catch(() => -1);
+        if (recheck > 20) {
+          throw new Error(
+            `自动清空失败(仍 ${recheck} 字符)——X 的会话恢复顽固,请手动删除该草稿后重跑。`,
+          );
+        }
+        console.log(`[prefill] 已自动清空恢复内容 ✓`);
       }
       await fillTitle(client, article.title, selectors);
       if (args.pasteHtml) {
