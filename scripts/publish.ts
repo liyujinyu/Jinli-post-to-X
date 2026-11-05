@@ -48,10 +48,12 @@ type Args = {
   chromePath?: string;
 };
 
-function parseArgs(argv: string[]): Args {
+export function parseArgs(argv: string[]): Args {
   const positional: string[] = [];
   let noImages = false;
-  let pasteHtml = false;
+  // Rich-HTML paste is the stable/default path: it avoids a long sequence of
+  // per-block toolbar edits during which X can autosave/remount the editor.
+  let pasteHtml = true;
   let finishOnly = false;
   let port = 9222;
   let profileDir = path.join(os.homedir(), '.local', 'share', 'x-browser-profile');
@@ -61,6 +63,7 @@ function parseArgs(argv: string[]): Args {
     const a = argv[i];
     if (a === '--no-images') noImages = true;
     else if (a === '--paste-html') pasteHtml = true;
+    else if (a === '--legacy-inline') pasteHtml = false;
     else if (a === '--finish-only') finishOnly = true;
     else if (a === '--port') port = Number(argv[++i]);
     else if (a === '--profile') profileDir = argv[++i];
@@ -71,7 +74,7 @@ function parseArgs(argv: string[]): Args {
   }
 
   if (positional.length === 0) {
-    console.error('Usage: bun publish.ts <article.md> [--no-images] [--port 9222] [--profile <dir>] [--chrome <path>]');
+    console.error('Usage: bun publish.ts <article.md> [--no-images] [--legacy-inline] [--port 9222] [--profile <dir>] [--chrome <path>]');
     process.exit(1);
   }
   return { mdPath: positional[0], noImages, pasteHtml, finishOnly, port, profileDir, chromePath };
@@ -613,7 +616,7 @@ function runsHtml(runs: InlineRun[]): string {
   return out;
 }
 
-function blocksToHtml(blocks: Block[]): string {
+export function blocksToHtml(blocks: Block[]): string {
   const parts: string[] = [];
   let listBuf: Extract<Block, { kind: 'listitem' }>[] = [];
   const flushList = () => {
@@ -627,6 +630,9 @@ function blocksToHtml(blocks: Block[]): string {
   for (const b of blocks) {
     switch (b.kind) {
       case 'listitem':
+        // A change from UL to OL (or vice versa) starts a new list. Keeping both
+        // in one buffer made X render an ordered item as another bullet.
+        if (listBuf.length && listBuf[0]!.ordered !== b.ordered) flushList();
         listBuf.push(b);
         break;
       case 'heading': {
@@ -2034,14 +2040,17 @@ async function main() {
         await fillBody(client, article.blocks, selectors, path.basename(args.profileDir), draftId);
       }
     }
-    if (codeBlocks.length) {
-      await insertCodeBlocks(client, codeBlocks, selectors, path.basename(args.profileDir));
-    }
     const hrBlocks = article.blocks.filter(
       (b): b is Block & { kind: 'hr' } => b.kind === 'hr',
     );
+    // Dividers must be converted before code cards. Code-card cleanup removes
+    // the token block immediately above the card; when an HR token sat there it
+    // was mistaken for cleanup debris and disappeared before HR conversion.
     if (hrBlocks.length) {
       await insertHrBlocks(client, hrBlocks, selectors, path.basename(args.profileDir), draftId);
+    }
+    if (codeBlocks.length) {
+      await insertCodeBlocks(client, codeBlocks, selectors, path.basename(args.profileDir));
     }
     // Headings + quotes + list items: style the token blocks, then swap in real text.
     if (!args.pasteHtml) {
@@ -2091,7 +2100,9 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error('\n✗ failed:', err instanceof Error ? err.message : err);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error('\n✗ failed:', err instanceof Error ? err.message : err);
+    process.exit(1);
+  });
+}

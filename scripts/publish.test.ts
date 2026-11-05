@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { blocksToHtml } from './publish';
+import { blocksToHtml, parseArgs } from './publish';
 import type { Block } from './markdown';
 
 describe('rich HTML assembly regressions', () => {
@@ -11,5 +11,10 @@ describe('rich HTML assembly regressions', () => {
     ];
 
     expect(blocksToHtml(blocks)).toBe('<ul><li>A</li><li>B</li></ul><ol><li>C</li></ol>');
+  });
+
+  test('uses rich HTML by default and keeps an explicit legacy escape hatch', () => {
+    expect(parseArgs(['article.md']).pasteHtml).toBe(true);
+    expect(parseArgs(['article.md', '--legacy-inline']).pasteHtml).toBe(false);
   });
 });

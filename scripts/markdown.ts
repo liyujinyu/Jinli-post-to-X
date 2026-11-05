@@ -342,7 +342,7 @@ export function parseArticle(mdPath: string): ParsedArticle {
 
   const blocks: Block[] = [];
   let pendingParagraph = '';
-  let sawFirstH1 = false;
+  let skippedTitleH1 = false;
   let imageCount = 0;
   let headingCount = 0;
   let listCount = 0;
@@ -356,8 +356,9 @@ export function parseArticle(mdPath: string): ParsedArticle {
   const flushQuote = () => {
     if (quoteBuf.length) {
       quoteCount++;
-      const text = quoteBuf.join(' ').trim();
-      const runs = parseRuns(text);
+      const raw = quoteBuf.join(' ').trim();
+      const runs = parseRuns(raw);
+      const text = runs.map((r) => r.text).join('');
       blocks.push({ kind: 'quote', text, runs, token: quoteToken(quoteCount) });
       quoteBuf = [];
     }
@@ -442,13 +443,17 @@ export function parseArticle(mdPath: string): ParsedArticle {
       continue;
     }
 
-    // Headings: the FIRST heading in the document is dropped (it duplicates the
-    // frontmatter title). Every later heading becomes a heading block — X gets
+    // Headings: skip only an H1 that actually duplicates the frontmatter title.
+    // The previous "drop the first heading unconditionally" behavior silently
+    // deleted a document whose first section started at H2. Every other heading
+    // becomes a heading block — X gets
     // ## → 标题 (header-one), ### or deeper → 副标题 (header-two).
     const head = line.trim().match(/^(#{1,6})\s+(.*)$/);
     if (head) {
-      if (!sawFirstH1) {
-        sawFirstH1 = true;
+      const level = head[1]!.length;
+      const text = stripInline(head[2] ?? '');
+      if (!skippedTitleH1 && level === 1 && fm.title && text.trim() === fm.title.trim()) {
+        skippedTitleH1 = true;
         flushInline();
         continue;
       }
@@ -456,8 +461,8 @@ export function parseArticle(mdPath: string): ParsedArticle {
       headingCount++;
       blocks.push({
         kind: 'heading',
-        level: head[1]!.length,
-        text: stripInline(head[2] ?? ''),
+        level,
+        text,
         token: headingToken(headingCount),
       });
       continue;
