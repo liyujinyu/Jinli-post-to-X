@@ -1638,7 +1638,7 @@ async function insertHrBlocks(
 }
 
 /**
- * Phase 2: replace each placeholder token with its image, in document order.
+ * Phase 2: replace each placeholder token with its image, from bottom to top.
  * For each token: highlight it via the Selection API (the browser then PASTES
  * OVER the current selection), load the image on the clipboard, and send a real
  * Ctrl+V. The image lands exactly where the token was. This is the empirically
@@ -1653,11 +1653,16 @@ async function insertImages(
 ): Promise<void> {
   console.log(`\n=== insertImages (${imageBlocks.length}, paste-replace tokens) ===`);
   let ok = 0;
-  for (let i = 0; i < imageBlocks.length; i++) {
-    const im = imageBlocks[i] as Extract<Block, { kind: 'image' }>;
+  // Bottom-to-top is critical on long articles: every native image insertion
+  // remounts/shifts DraftJS blocks below the caret. Replacing later tokens first
+  // keeps all still-pending token positions stable and prevents stale internal
+  // selections from pasting into the neighbouring paragraph.
+  for (let step = 0; step < imageBlocks.length; step++) {
+    const sourceIndex = imageBlocks.length - 1 - step;
+    const im = imageBlocks[sourceIndex] as Extract<Block, { kind: 'image' }>;
     await ensureDraftId(client, draftId);
     const before = await countImgs(client, selectors);
-    console.log(`- token[${i + 1}] ${im.token} ← ${path.basename(im.path)}`);
+    console.log(`- token[${sourceIndex + 1}/${imageBlocks.length}] ${im.token} ← ${path.basename(im.path)}`);
 
     // Highlight the token text AND verify the DOM selection holds it. A paste
     // (or its {DELETE}) at a stale DraftJS internal selection is what corrupts
@@ -1670,7 +1675,7 @@ async function insertImages(
 
     // First image needs a cold-start focus priming; subsequent ones stay warm.
     await client.bringToFront();
-    await sleep(i === 0 ? 600 : 250);
+    await sleep(step === 0 ? 600 : 250);
     // One atomic OS call: activate → {DELETE} removes the highlighted token →
     // load image → Ctrl+V pastes it into the same spot. deleteFirst=true so the
     // token is gone and the image replaces it, in one process (no focus gap, no
