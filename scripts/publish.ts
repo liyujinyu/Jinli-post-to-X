@@ -1332,17 +1332,24 @@ async function insertCodeBlocks(
       }
       await client.eval(`(() => {
         const m = document.querySelector('[role="dialog"]');
-        const ta = m.querySelector('textarea');
+        // 2026-11-05: X 改了代码卡对话框——语言输入框失去 testid、新增「添加标题」
+        // 字段。策略: 跳过 placeholder=添加标题 的标题框,把代码写进剩余 textarea 中
+        // 尺寸最大的那个(即代码正文框);语言留空(默认纯文本)。
+        const tas = [...m.querySelectorAll('textarea')]
+          .filter(t => (t.getAttribute('placeholder') || '') !== '添加标题');
+        if (!tas.length) return 'NO-CODE-TA';
+        const code = window.__jptxCode || '';
+        const ta = tas.reduce((a, b) => (b.value.length >= a.value.length ? b : a));
         const setTa = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
-        setTa.call(ta, window.__jptxCode || '');
+        setTa.call(ta, code);
         ta.dispatchEvent(new Event('input', { bubbles: true }));
-        const li = m.querySelector('input[data-testid="programming-language-input"]');
+        const li = m.querySelector('input[data-testid="programming-language-input"], input[placeholder*="语言"], input[placeholder*="language"]');
         if (li && window.__jptxLang) {
           const setLi = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
           setLi.call(li, window.__jptxLang);
           li.dispatchEvent(new Event('input', { bubbles: true }));
         }
-        return 1; })()`);
+        return 'FILLED'; })()`);
       await sleep(500);
       const inserted = await client.eval<string>(`(() => {
         const m = document.querySelector('[role="dialog"]');
