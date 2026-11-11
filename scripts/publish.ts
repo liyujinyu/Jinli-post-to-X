@@ -1284,9 +1284,15 @@ async function insertCodeBlocks(
 ): Promise<void> {
   console.log(`\n=== insertCodeBlocks (${codeBlocks.length}, native code cards via 插入→代码) ===`);
   let ok = 0;
-  for (let i = 0; i < codeBlocks.length; i++) {
-    const cb = codeBlocks[i] as Extract<Block, { kind: 'code' }>;
-    console.log(`- token[${i + 1}] ${cb.token} ← ${cb.lang || 'text'} (${cb.text.split('\n').length} lines)`);
+  // Native code-card insertion remounts/reorders DraftJS blocks below the
+  // insertion point. Process tokens bottom-to-top so every pending token above
+  // the current card keeps a stable editor position. The old top-to-bottom
+  // loop reliably inserted card 1, then failed to open the dialog for cards
+  // 2..N on prompt-heavy articles (2026-11-11 regression).
+  for (let step = 0; step < codeBlocks.length; step++) {
+    const sourceIndex = codeBlocks.length - 1 - step;
+    const cb = codeBlocks[sourceIndex] as Extract<Block, { kind: 'code' }>;
+    console.log(`- token[${sourceIndex + 1}/${codeBlocks.length}] ${cb.token} ← ${cb.lang || 'text'} (${cb.text.split('\n').length} lines)`);
 
     // Dead-page guard (2026-09-20 crash): the editor can unmount mid-run
     // (auto-save / remount) — poking a dead page produced a NOMENU→NOCOMPOSER
@@ -1298,7 +1304,7 @@ async function insertCodeBlocks(
       .catch(() => false);
     if (!composerUp) {
       console.warn(
-        `  ! composer not present — editor likely reloaded; skipping remaining ${codeBlocks.length - i} code token(s)`,
+        `  ! composer not present — editor likely reloaded; skipping remaining ${codeBlocks.length - step} code token(s)`,
       );
       break;
     }
@@ -1450,7 +1456,7 @@ async function insertCodeBlocks(
           } catch (e) { return 'ERR:' + e.message; } })()`,
         );
         if (emptyAbove !== 'EMPTY') break;
-        console.log(`  · stray blank line above code card ${i + 1}, removing (round ${r + 1})`);
+        console.log(`  · stray blank line above code card ${sourceIndex + 1}, removing (round ${r + 1})`);
         await sleep(400);
         await client.bringToFront();
         await sleep(250);
@@ -1480,7 +1486,12 @@ async function insertCodeBlocks(
         console.warn(`  ! verify failed (gone=${state?.gone}, card=${state?.card})`);
       }
     }
-    if (done) ok++;
+    if (done) {
+      ok++;
+      // Give X's autosave/remount cycle time to settle before selecting the
+      // next token above this newly inserted non-editable block.
+      await sleep(600);
+    }
   }
   console.log(`  code cards inserted: ${ok}/${codeBlocks.length}`);
   await snapshot(client, selectors, 'insertCodeBlocks:after');
