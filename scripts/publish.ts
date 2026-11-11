@@ -1281,6 +1281,7 @@ async function insertCodeBlocks(
   codeBlocks: Block[],
   selectors: Selectors,
   profileMarker: string,
+  draftId: string | null,
 ): Promise<void> {
   console.log(`\n=== insertCodeBlocks (${codeBlocks.length}, native code cards via 插入→代码) ===`);
   let ok = 0;
@@ -1523,7 +1524,38 @@ async function insertCodeBlocks(
       ok++;
       // Give X's autosave/remount cycle time to settle before selecting the
       // next token above this newly inserted non-editable block.
-      await sleep(600);
+      await sleep(800);
+
+      // Prompt-heavy articles trigger an editor remount after several large
+      // code cards. Once that happens, DraftJS keeps a stale internal selection
+      // and every later code/image insertion misses. Checkpoint every 3 cards:
+      // wait for autosave, reload this exact draft, and verify all cards survived
+      // before continuing with the remaining tokens.
+      const morePending = step < codeBlocks.length - 1;
+      if (morePending && ok % 3 === 0) {
+        const beforeReload = await client.eval<number>(
+          `document.querySelectorAll(${JSON.stringify(selectors.composer)} [data-testid="markdown-code-block"]).length`,
+        );
+        console.log(`  · checkpoint after ${ok} code cards: waiting for autosave…`);
+        await sleep(5000);
+        await client.send('Page.reload', { ignoreCache: false });
+        const mounted = await client.waitFor(
+          `!!document.querySelector(${JSON.stringify(selectors.composer)})`,
+          60_000,
+        ).catch(() => false);
+        if (!mounted) throw new Error(`code checkpoint reload failed: composer did not remount after ${ok} cards`);
+        await ensureDraftId(client, draftId);
+        const afterReload = await client.eval<number>(
+          `document.querySelectorAll(${JSON.stringify(selectors.composer)} [data-testid="markdown-code-block"]).length`,
+        );
+        if (afterReload < beforeReload) {
+          throw new Error(
+            `code checkpoint lost unsaved cards (${beforeReload} → ${afterReload}); stopped to prevent corruption`,
+          );
+        }
+        console.log(`  ✓ checkpoint reloaded (${afterReload} code cards preserved)`);
+        await sleep(800);
+      }
     }
   }
   console.log(`  code cards inserted: ${ok}/${codeBlocks.length}`);
@@ -2132,7 +2164,7 @@ async function main() {
       await insertHrBlocks(client, hrBlocks, selectors, path.basename(args.profileDir), draftId);
     }
     if (codeBlocks.length) {
-      await insertCodeBlocks(client, codeBlocks, selectors, path.basename(args.profileDir));
+      await insertCodeBlocks(client, codeBlocks, selectors, path.basename(args.profileDir), draftId);
     }
     // Headings + quotes + list items: style the token blocks, then swap in real text.
     if (!args.pasteHtml) {
