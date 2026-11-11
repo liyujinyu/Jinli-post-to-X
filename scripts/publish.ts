@@ -1312,32 +1312,47 @@ async function insertCodeBlocks(
     let done = false;
     for (let attempt = 0; attempt < 2 && !done; attempt++) {
       // Step 1: collapsed caret inside the token block; stash the code text.
-      const prep = await client.eval<string>(
+      const prep = await client.eval<{ status: string }>(
         `(() => { try {
           const c = document.querySelector(${JSON.stringify(selectors.composer)});
-          if (!c) return 'NOCOMPOSER';
+          if (!c) return { status: 'NOCOMPOSER' };
           const b = [...c.querySelectorAll('[data-block="true"]')]
             .find(x => (x.innerText || '').includes(${JSON.stringify(cb.token)}));
-          if (!b) return 'NOBLOCK';
+          if (!b) return { status: 'NOBLOCK' };
           b.scrollIntoView({ block: 'center' });
           window.__jptxCode = ${JSON.stringify(cb.text)};
           window.__jptxLang = ${JSON.stringify(cb.lang || '')};
+          // Focus FIRST. Calling focus after addRange resets DraftJS's newly
+          // assigned caret to its previous internal selection after remounts.
+          const ce = b.closest('[contenteditable="true"]');
+          if (!ce) return { status: 'NOEDITOR' };
+          ce.focus();
           const walker = document.createTreeWalker(b, NodeFilter.SHOW_TEXT);
           const tn = walker.nextNode();
+          if (!tn) return { status: 'NOTEXT' };
           const rg = document.createRange();
-          if (tn) { rg.setStart(tn, 0); rg.collapse(true); }
-          else { rg.selectNodeContents(b); rg.collapse(true); }
+          rg.setStart(tn, 0);
+          rg.collapse(true);
           const s = window.getSelection();
           s.removeAllRanges(); s.addRange(rg);
-          b.closest('[contenteditable="true"]')?.focus();
-          return 'OK';
-        } catch (e) { return 'ERR:' + e.message; } })()`,
+          return { status: 'OK' };
+        } catch (e) { return { status: 'ERR:' + e.message }; } })()`,
       );
-      if (prep !== 'OK') {
-        console.warn(`  ! caret prep failed (${prep}, attempt ${attempt + 1})`);
+      if (prep?.status !== 'OK') {
+        console.warn(`  ! caret prep failed (${prep?.status || 'UNKNOWN'}, attempt ${attempt + 1})`);
         continue;
       }
-      await sleep(450);
+      await sleep(500);
+      const caretReady = await client.eval<boolean>(`(() => {
+        const s = window.getSelection();
+        if (!s || !s.anchorNode || !s.isCollapsed) return false;
+        const b = s.anchorNode.nodeType === Node.TEXT_NODE ? s.anchorNode.parentElement?.closest('[data-block="true"]') : s.anchorNode.closest?.('[data-block="true"]');
+        return !!b && (b.innerText || '').includes(${JSON.stringify(cb.token)});
+      })()`).catch(() => false);
+      if (!caretReady) {
+        console.warn(`  ! caret did not remain in token block (attempt ${attempt + 1})`);
+        continue;
+      }
 
       // Step 2: 插入 → 代码.
       await client.eval(`(() => { const b=[...document.querySelectorAll('button')]
@@ -1411,7 +1426,12 @@ async function insertCodeBlocks(
       if (tokenSelected) {
         await client.bringToFront();
         await sleep(250);
-        await deleteSelection(1, profileMarker);
+        try {
+          await deleteSelection(1, profileMarker);
+        } catch (e) {
+          console.warn(`  ! OS delete focus failed; falling back to CDP Delete: ${(e as Error).message.split('\n')[0]}`);
+          await client.pressKey(46, 'Delete', 'Delete');
+        }
         await sleep(1200);
       } else {
         console.warn(`  ! exact code token selection failed; leaving token in place to protect following content`);
@@ -1431,7 +1451,12 @@ async function insertCodeBlocks(
         await sleep(400);
         await client.bringToFront();
         await sleep(250);
-        await sendKeys('{BS}', profileMarker);
+        try {
+          await sendKeys('{BS}', profileMarker);
+        } catch (e) {
+          console.warn(`  ! OS backspace focus failed; falling back to CDP Backspace: ${(e as Error).message.split('\n')[0]}`);
+          await client.pressKey(8, 'Backspace', 'Backspace');
+        }
         await sleep(1300);
       }
 
@@ -1463,7 +1488,12 @@ async function insertCodeBlocks(
         await sleep(400);
         await client.bringToFront();
         await sleep(250);
-        await sendKeys('{BS}', profileMarker);
+        try {
+          await sendKeys('{BS}', profileMarker);
+        } catch (e) {
+          console.warn(`  ! OS cleanup backspace failed; falling back to CDP Backspace: ${(e as Error).message.split('\n')[0]}`);
+          await client.pressKey(8, 'Backspace', 'Backspace');
+        }
         await sleep(900);
       }
 
