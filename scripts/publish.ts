@@ -1577,11 +1577,11 @@ async function insertHrBlocks(
       // Step 2: 插入 → 分割线 (multi-locale menu text fallbacks).
       const before = await countHrs();
       await client.eval(`(() => { const b=[...document.querySelectorAll('button')]
-        .find(x => (x.innerText || '').trim() === '插入'); if (b) b.click(); })()`);
+        .find(x => (x.innerText || '').trim() === '插入' && x.offsetParent !== null); if (b) b.click(); })()`);
       await sleep(800);
       const menu = await client.eval<string>(`(() => {
         const items = [...document.querySelectorAll('[role="menuitem"], [role="option"]')];
-        const m = items.find(x => ['分割线','Divider','区切り線','구분선'].includes((x.innerText || '').trim()));
+        const m = items.find(x => x.offsetParent !== null && ['分割线','Divider','区切り線','구분선'].includes((x.innerText || '').trim()));
         if (!m) return 'NOMENU';
         m.click(); return 'OK'; })()`);
       if (menu !== 'OK') {
