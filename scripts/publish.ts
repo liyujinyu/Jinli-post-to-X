@@ -1341,11 +1341,14 @@ async function insertCodeBlocks(
 
       // Step 2: 插入 → 代码.
       await client.eval(`(() => { const b=[...document.querySelectorAll('button')]
-        .find(x => (x.innerText || '').trim() === '插入'); if (b) b.click(); })()`);
+        .find(x => (x.innerText || '').trim() === '插入' && x.offsetParent !== null); if (b) b.click(); })()`);
       await sleep(800);
       const menu = await client.eval<string>(`(() => {
         const items = [...document.querySelectorAll('[role="menuitem"], [role="option"]')];
-        const m = items.find(x => (x.innerText || '').trim() === '代码');
+        // X keeps stale hidden menus mounted after repeated insertions. Clicking
+        // the first text match eventually targets an invisible old item and no
+        // dialog opens. Only the currently visible menu item is actionable.
+        const m = items.find(x => x.offsetParent !== null && (x.innerText || '').trim() === '代码');
         if (!m) return 'NOMENU';
         m.click(); return 'OK'; })()`);
       if (menu !== 'OK') {
@@ -1359,7 +1362,7 @@ async function insertCodeBlocks(
       for (let w = 0; w < 10 && dlg !== 'READY'; w++) {
         await sleep(300);
         dlg = await client.eval<string>(
-          `document.querySelector('[role="dialog"] textarea') ? 'READY' : 'WAIT'`,
+          `[...document.querySelectorAll('[role="dialog"]')].some(d => d.offsetParent !== null && d.querySelector('textarea')) ? 'READY' : 'WAIT'`,
         );
       }
       if (dlg !== 'READY') {
@@ -1367,7 +1370,7 @@ async function insertCodeBlocks(
         continue;
       }
       await client.eval(`(() => {
-        const m = document.querySelector('[role="dialog"]');
+        const m = [...document.querySelectorAll('[role="dialog"]')].find(d => d.offsetParent !== null);
         // 2026-11-05: X 改了代码卡对话框——语言输入框失去 testid、新增「添加标题」
         // 字段。策略: 跳过 placeholder=添加标题 的标题框,把代码写进剩余 textarea 中
         // 尺寸最大的那个(即代码正文框);语言留空(默认纯文本)。
@@ -1388,9 +1391,9 @@ async function insertCodeBlocks(
         return 'FILLED'; })()`);
       await sleep(500);
       const inserted = await client.eval<string>(`(() => {
-        const m = document.querySelector('[role="dialog"]');
+        const m = [...document.querySelectorAll('[role="dialog"]')].find(d => d.offsetParent !== null);
         if (!m) return 'NODLG';
-        const b = [...m.querySelectorAll('button')].find(x => (x.innerText || '').trim() === '插入');
+        const b = [...m.querySelectorAll('button')].find(x => x.offsetParent !== null && (x.innerText || '').trim() === '插入');
         if (!b) return 'NOBTN';
         b.click(); return 'OK'; })()`);
       if (inserted !== 'OK') {
